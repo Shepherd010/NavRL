@@ -56,8 +56,10 @@ def main(cfg):
     transforms.append(vel_transform)
     transformed_env = TransformedEnv(env, Compose(*transforms)).train()
     transformed_env.set_seed(cfg.seed)    
-    # PPO Policy
-    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    # PPO Policy (pass topo_cfg when graph_ppo mode is active)
+    _topo_cfg = cfg.topo if (hasattr(cfg, 'topo') and cfg.topo.use_topo) else None
+    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
+                 topo_cfg=_topo_cfg)
 
     # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
     # checkpoint = "/home/xinmingh/RLDrones/navigation/scripts/nav-ros/navigation_runner/ckpts/checkpoint_36000.pt"

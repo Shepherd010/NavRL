@@ -5,6 +5,8 @@ from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 from omni_drones.envs.isaac_env import IsaacEnv, AgentSpec
 import omni.isaac.orbit.sim as sim_utils
+# Topology-based graph navigation modules (pure PyTorch, no Isaac dependency)
+# Imported lazily inside __init__ so the file is importable without Isaac when use_topo=False
 from omni_drones.robots.drone import MultirotorBase
 from omni.isaac.orbit.assets import AssetBaseCfg
 from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
@@ -40,6 +42,37 @@ class NavigationEnv(IsaacEnv):
         
         # Drone Initialization
         self.drone.initialize()
+
+        # Graph-based topology navigation modules (guarded by cfg.topo.use_topo)
+        self.use_topo = hasattr(cfg, 'topo') and cfg.topo.use_topo
+        if self.use_topo:
+            import sys, os
+            sys.path.insert(0, os.path.dirname(__file__))
+            from topo_extractor import TopoExtractor
+            from safety_shield import SafetyShieldQP
+            from hierarchical_control import HierarchicalController
+            self.topo_extractor = TopoExtractor(cfg.topo)
+            self.safety_shield  = SafetyShieldQP(
+                relaxation_weight=float(cfg.topo.qp_relaxation_weight),
+                max_relaxation=float(cfg.topo.qp_max_relaxation),
+                v_max=float(cfg.topo.qp_v_max),
+                safe_distance=float(cfg.topo.qp_safe_distance),
+                cbf_alpha=float(cfg.topo.qp_cbf_alpha),
+            )
+            self.hierarchical_controller = HierarchicalController(
+                high_freq=float(cfg.topo.high_freq),
+                low_freq=float(cfg.topo.low_freq),
+                pid_kp=float(cfg.topo.pid_kp),
+                pid_kd=float(cfg.topo.pid_kd),
+                pid_ki=float(cfg.topo.pid_ki),
+                goal_horizon=float(cfg.topo.goal_horizon),
+                integral_limit=float(cfg.topo.pid_integral_limit),
+            )
+            self.hierarchical_controller.reset(self.num_envs, self.device)
+            # Cache for last topo output (used in _pre_sim_step)
+            self._last_topo_node_positions = None
+            self._last_intervention        = None   # (B,) set by _pre_sim_step_graph
+            self._last_tracking_error      = None   # (B,) set by _pre_sim_step_graph
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
 
 
@@ -307,6 +340,24 @@ class NavigationEnv(IsaacEnv):
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
         
+        # Optional graph observation keys (added before action spec)
+        if hasattr(self.cfg, 'topo') and self.cfg.topo.use_topo:
+            _N = self.cfg.topo.max_nodes        # candidate nodes (ego excluded)
+            _nf = self.cfg.topo.node_feat_dim   # 18
+            _ef = self.cfg.topo.edge_feat_dim   # 7
+            # Inject into the existing observation CompositeSpec
+            self.observation_spec["agents"]["observation"]["node_features"]  = \
+                UnboundedContinuousTensorSpec((_N + 1, _nf), device=self.device)
+            self.observation_spec["agents"]["observation"]["node_positions"] = \
+                UnboundedContinuousTensorSpec((_N + 1, 3), device=self.device)
+            self.observation_spec["agents"]["observation"]["edge_features"]  = \
+                UnboundedContinuousTensorSpec((_N + 1, _N + 1, _ef), device=self.device)
+            # masks stored as float (0.0 / 1.0) – cast to bool before use in GraphTransformer
+            self.observation_spec["agents"]["observation"]["node_mask"] = \
+                UnboundedContinuousTensorSpec((_N + 1,), device=self.device)
+            self.observation_spec["agents"]["observation"]["edge_mask"] = \
+                UnboundedContinuousTensorSpec((_N + 1, _N + 1), device=self.device)
+
         # Action Spec
         self.action_spec = CompositeSpec({
             "agents": CompositeSpec({
@@ -416,11 +467,66 @@ class NavigationEnv(IsaacEnv):
         self.height_range[env_ids, 0, 0] = torch.min(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
-        self.stats[env_ids] = 0.  
+        self.stats[env_ids] = 0.
+        # pit #5: reset hierarchical controller PID state for terminated envs
+        if self.use_topo:
+            self.hierarchical_controller.reset_partial(env_ids)
         
     def _pre_sim_step(self, tensordict: TensorDictBase):
-        actions = tensordict[("agents", "action")] 
-        self.drone.apply_action(actions) 
+        if self.use_topo:
+            self._pre_sim_step_graph(tensordict)
+        else:
+            actions = tensordict[("agents", "action")]
+            self.drone.apply_action(actions)
+
+    def _pre_sim_step_graph(self, tensordict: TensorDictBase):
+        """Graph-PPO control chain: discrete action → velocity → QP → hierarchical PID → drone.
+
+        The PPO stored:
+          - tensordict["agents", "action"]: (B, 1, 3) world velocity command from node→vel
+          - tensordict["_graph_action"]:    (B,)      discrete node index (0-based in candidates)
+        We re-derive the world velocity from stored action (already computed in ppo._forward_graph),
+        then pass through SafetyShieldQP and HierarchicalController before sending to the drone.
+        """
+        B      = self.num_envs
+        device = self.device
+
+        # -- World velocity from policy (already set by PPO._forward_graph) --
+        v_rl = tensordict["agents", "action"].squeeze(1)  # (B, 3)
+
+        # -- Build obstacle tensor for QP: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, radius] --
+        if hasattr(self, 'dyn_obs_state') and self.cfg.env_dyn.num_obstacles > 0:
+            obs_pos = self.dyn_obs_state[:, :3].unsqueeze(0).expand(B, -1, -1)  # (B, N_obs, 3)
+            obs_vel = self.dyn_obs_vel.unsqueeze(0).expand(B, -1, -1)            # (B, N_obs, 3)
+            obs_r   = (self.dyn_obs_size[:, 0] / 2.).unsqueeze(0).expand(B, -1).unsqueeze(-1)  # (B, N_obs, 1)
+            obstacles = torch.cat([obs_pos, obs_vel, obs_r], dim=-1)             # (B, N_obs, 7)
+        else:
+            obstacles = torch.zeros(B, 0, 7, device=device)
+
+        ego_pos_3d = self.drone.pos.squeeze(1)   # (B, 3)
+        ego_vel_3d = self.root_state[..., 7:10].squeeze(1) if hasattr(self, 'root_state') \
+                     else torch.zeros(B, 3, device=device)
+
+        # -- SafetyShieldQP --
+        v_safe, intervention = self.safety_shield.solve(v_rl, obstacles, ego_pos_3d)
+
+        # Cache for reward shaping (read in _compute_state_and_obs)
+        self._last_intervention  = intervention   # (B,)
+
+        # -- HierarchicalController --
+        is_hl = self.hierarchical_controller.is_high_level_step()
+        ctrl_vel, ctrl_info = self.hierarchical_controller.step(
+            ego_pos=ego_pos_3d,
+            ego_vel=ego_vel_3d,
+            high_level_velocity=v_safe if is_hl else None,
+        )
+        self._last_tracking_error = ctrl_info["tracking_error"]  # (B,)
+
+        # -- Send final velocity command to drone via VelController action format --
+        # The downstream VelController transform converts (B, 1, 3) vel → motor thrust.
+        tensordict["agents", "action"] = ctrl_vel.unsqueeze(1)  # (B, 1, 3)
+        self.drone.apply_action(tensordict[("agents", "action")])
+
 
     def _post_sim_step(self, tensordict: TensorDictBase):
         if (self.cfg.env_dyn.num_obstacles != 0):
@@ -543,6 +649,27 @@ class NavigationEnv(IsaacEnv):
             "dynamic_obstacle": dyn_obs_states
         }
 
+        # ----- Graph topology observation (when use_topo=True) -----
+        if self.use_topo:
+            # dyn_obs_states: (B, 1, N_dyn, 10) → squeeze to (B, N_dyn, 10)  [pit #9]
+            dyn_obs_for_topo = dyn_obs_states.squeeze(1)  # (B, N_dyn, 10)
+            # LiDAR world hit positions and sensor position
+            ray_hits_w = self.lidar.data.ray_hits_w  # (B, N_rays, 3)
+            ray_pos_w  = self.lidar.data.pos_w       # (B, 3)
+            ego_vel_3d  = vel_w.squeeze(1)           # (B, 3)
+            tgt_pos_3d  = self.target_pos.squeeze(1) # (B, 3)
+            topo_out = self.topo_extractor.extract_topology(
+                ray_hits_w, ray_pos_w, dyn_obs_for_topo, ego_vel_3d, tgt_pos_3d
+            )
+            # Cache node positions for _pre_sim_step
+            self._last_topo_node_positions = topo_out["node_positions"]  # (B, N+1, 3)
+            # Add to obs dict (masks as float for TorchRL spec compatibility)
+            obs["node_features"]  = topo_out["node_features"]
+            obs["node_positions"] = topo_out["node_positions"]
+            obs["edge_features"]  = topo_out["edge_features"]
+            obs["node_mask"]      = topo_out["node_mask"].float()
+            obs["edge_mask"]      = topo_out["edge_mask"].float()
+
 
         # -----------------Reward Calculation-----------------
         # a. safety reward for static obstacles
@@ -575,6 +702,19 @@ class NavigationEnv(IsaacEnv):
             self.reward = reward_vel + 1. + reward_safety_static * 1.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
         else:
             self.reward = reward_vel + 1. + reward_safety_static * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+
+        # Graph-PPO reward shaping: QP intervention penalty + tracking error penalty
+        # Cached by _pre_sim_step_graph; absent when use_topo=False.
+        # doc/06 §阶段3 reward: r_intv = 0.2*(exp(-I²/(2×0.5²))-1), r_freq = -0.5*𝟙[I>1.0]
+        if self.use_topo and hasattr(self, '_last_intervention') and self._last_intervention is not None:
+            I_t     = self._last_intervention                              # (B,)
+            r_intv  = 0.2 * (torch.exp(-I_t ** 2 / (2 * 0.25)) - 1.0)    # 0.25 = 2*0.5²
+            r_freq  = -0.5 * (I_t > 1.0).float()
+            track_w = float(self.cfg.topo.reward_tracking_weight)          # e.g. -0.1
+            self.reward = self.reward \
+                + r_intv.unsqueeze(-1) \
+                + r_freq.unsqueeze(-1) \
+                + track_w * self._last_tracking_error.unsqueeze(-1)
 
         # Terminal reward
         # self.reward[collision] -= 50. # collision

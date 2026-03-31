@@ -27,6 +27,12 @@ ln -s ${ISAACSIM_PATH} _isaac_sim
 echo "Running orbit.sh setup..."
 ./orbit.sh --conda $ENV_NAME
 conda activate $ENV_NAME
+
+# WSL2: add libcuda.so path so PhysX/Isaac Sim can find it
+mkdir -p $CONDA_PREFIX/etc/conda/activate.d
+echo 'export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH' \
+    >> $CONDA_PREFIX/etc/conda/activate.d/setenv.sh
+
 pip install numpy==1.26.4
 pip install "pydantic!=1.7,!=1.7.1,!=1.7.2,!=1.7.3,!=1.8,!=1.8.1,<2.0.0,>=1.6.2"
 pip install imageio-ffmpeg==0.4.9

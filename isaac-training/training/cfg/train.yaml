@@ -3,8 +3,10 @@ defaults:
   - drone
   - ppo
   - sim
+  - topo
 
-headless: False
+headless: True
+mode: ppo  # ppo | graph_ppo
 device: "cuda:0"
 seed: 0
 
