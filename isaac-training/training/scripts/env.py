@@ -38,11 +38,6 @@ class NavigationEnv(IsaacEnv):
         self.lidar_hres = cfg.sensor.lidar_hres
         self.lidar_hbeams = int(360/self.lidar_hres)
 
-        super().__init__(cfg, cfg.headless)
-        
-        # Drone Initialization
-        self.drone.initialize()
-
         # Graph-based topology navigation modules.
         # Require BOTH use_topo=true AND mode='graph_ppo' to be active.
         # This prevents accidental activation when mode=ppo (which would try to read
@@ -52,6 +47,12 @@ class NavigationEnv(IsaacEnv):
             hasattr(cfg, 'topo') and cfg.topo.use_topo
             and getattr(cfg, 'mode', 'ppo') == 'graph_ppo'
         )
+
+        super().__init__(cfg, cfg.headless)
+        
+        # Drone Initialization
+        self.drone.initialize()
+
         # lee_controller will be injected by train.py after construction so that
         # _pre_sim_step_graph can convert ctrl_vel → motor thrust without going
         # through VelController (which runs before _pre_sim_step).
