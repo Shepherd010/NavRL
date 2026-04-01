@@ -43,8 +43,19 @@ class NavigationEnv(IsaacEnv):
         # Drone Initialization
         self.drone.initialize()
 
-        # Graph-based topology navigation modules (guarded by cfg.topo.use_topo)
-        self.use_topo = hasattr(cfg, 'topo') and cfg.topo.use_topo
+        # Graph-based topology navigation modules.
+        # Require BOTH use_topo=true AND mode='graph_ppo' to be active.
+        # This prevents accidental activation when mode=ppo (which would try to read
+        # the velocity from tensordict["agents","action"] after VelController has already
+        # replaced it with motor thrusts).
+        self.use_topo = (
+            hasattr(cfg, 'topo') and cfg.topo.use_topo
+            and getattr(cfg, 'mode', 'ppo') == 'graph_ppo'
+        )
+        # lee_controller will be injected by train.py after construction so that
+        # _pre_sim_step_graph can convert ctrl_vel → motor thrust without going
+        # through VelController (which runs before _pre_sim_step).
+        self.lee_controller = None
         if self.use_topo:
             import sys, os
             sys.path.insert(0, os.path.dirname(__file__))
@@ -341,7 +352,7 @@ class NavigationEnv(IsaacEnv):
         }, shape=[self.num_envs], device=self.device)
         
         # Optional graph observation keys (added before action spec)
-        if hasattr(self.cfg, 'topo') and self.cfg.topo.use_topo:
+        if self.use_topo:
             _N = self.cfg.topo.max_nodes        # candidate nodes (ego excluded)
             _nf = self.cfg.topo.node_feat_dim   # 18
             _ef = self.cfg.topo.edge_feat_dim   # 7
@@ -482,17 +493,24 @@ class NavigationEnv(IsaacEnv):
     def _pre_sim_step_graph(self, tensordict: TensorDictBase):
         """Graph-PPO control chain: discrete action → velocity → QP → hierarchical PID → drone.
 
-        The PPO stored:
-          - tensordict["agents", "action"]: (B, 1, 3) world velocity command from node→vel
-          - tensordict["_graph_action"]:    (B,)      discrete node index (0-based in candidates)
-        We re-derive the world velocity from stored action (already computed in ppo._forward_graph),
-        then pass through SafetyShieldQP and HierarchicalController before sending to the drone.
+        Calling order (confirmed from IsaacEnv source):
+          1. TransformedEnv calls VelController._inv_call(tensordict)
+             → reads ("agents","action") as velocity (B,3), converts to motor thrusts (B,1,4),
+               writes motor thrusts back into tensordict["agents","action"].
+          2. IsaacEnv._step calls _pre_sim_step(tensordict)
+             → at this point tensordict["agents","action"] is already MOTOR THRUSTS.
+
+        Therefore we CANNOT read the policy velocity from tensordict["agents","action"] here.
+        PPO._forward_graph saves the raw velocity in tensordict["_v_rl"] (B,3) for us.
+
+        After QP + hierarchical PID we obtain ctrl_vel (B,3).  We must convert it to motor
+        thrusts ourselves using the injected lee_controller, then call drone.apply_action.
         """
         B      = self.num_envs
         device = self.device
 
-        # -- World velocity from policy (already set by PPO._forward_graph) --
-        v_rl = tensordict["agents", "action"].squeeze(1)  # (B, 3)
+        # -- World velocity from policy (saved before VelController overwrites action) --
+        v_rl = tensordict["_v_rl"]  # (B, 3)
 
         # -- Build obstacle tensor for QP: [pos_x, pos_y, pos_z, vel_x, vel_y, vel_z, radius] --
         if hasattr(self, 'dyn_obs_state') and self.cfg.env_dyn.num_obstacles > 0:
@@ -522,10 +540,17 @@ class NavigationEnv(IsaacEnv):
         )
         self._last_tracking_error = ctrl_info["tracking_error"]  # (B,)
 
-        # -- Send final velocity command to drone via VelController action format --
-        # The downstream VelController transform converts (B, 1, 3) vel → motor thrust.
-        tensordict["agents", "action"] = ctrl_vel.unsqueeze(1)  # (B, 1, 3)
-        self.drone.apply_action(tensordict[("agents", "action")])
+        # -- Convert ctrl_vel → motor thrust via LeePositionController --
+        # VelController already ran before _pre_sim_step; we must replicate what it did.
+        # drone_state: (B, 1, 13); ctrl_vel: (B, 3) → unsqueeze to (B, 1, 3) for Lee.
+        drone_state_13 = self.info["drone_state"]  # (B, 1, 13)
+        motor_cmds = self.lee_controller(
+            drone_state_13,
+            target_vel=ctrl_vel.unsqueeze(1),  # (B, 1, 3)
+            target_yaw=None,
+        )  # → (B, 1, num_rotors)
+        torch.nan_to_num_(motor_cmds, 0.)
+        self.drone.apply_action(motor_cmds)
 
 
     def _post_sim_step(self, tensordict: TensorDictBase):

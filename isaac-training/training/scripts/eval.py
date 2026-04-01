@@ -53,9 +53,16 @@ def main(cfg):
     vel_transform = VelController(controller, yaw_control=False)
     transforms.append(vel_transform)
     transformed_env = TransformedEnv(env, Compose(*transforms)).train()
-    transformed_env.set_seed(cfg.seed)    
+    transformed_env.set_seed(cfg.seed)
+
+    # Inject lee_controller for graph_ppo mode (same fix as train.py)
+    if env.use_topo:
+        env.lee_controller = controller
+
     # PPO Policy
-    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device)
+    _topo_cfg = cfg.topo if getattr(cfg, 'mode', 'ppo') == 'graph_ppo' else None
+    policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
+                 topo_cfg=_topo_cfg)
 
     checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_final.pt"
     policy.load_state_dict(torch.load(checkpoint))

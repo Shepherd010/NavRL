@@ -55,9 +55,16 @@ def main(cfg):
     vel_transform = VelController(controller, yaw_control=False)
     transforms.append(vel_transform)
     transformed_env = TransformedEnv(env, Compose(*transforms)).train()
-    transformed_env.set_seed(cfg.seed)    
+    transformed_env.set_seed(cfg.seed)
+
+    # Inject the same LeePositionController into env so that _pre_sim_step_graph can
+    # convert ctrl_vel → motor thrusts directly (VelController runs before _pre_sim_step,
+    # so we cannot rely on it inside _pre_sim_step).
+    if env.use_topo:
+        env.lee_controller = controller
+
     # PPO Policy (pass topo_cfg when graph_ppo mode is active)
-    _topo_cfg = cfg.topo if (hasattr(cfg, 'topo') and cfg.topo.use_topo) else None
+    _topo_cfg = cfg.topo if getattr(cfg, 'mode', 'ppo') == 'graph_ppo' else None
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
                  topo_cfg=_topo_cfg)
 

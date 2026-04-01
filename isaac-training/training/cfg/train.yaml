@@ -6,7 +6,7 @@ defaults:
   - topo
 
 headless: True
-mode: ppo  # ppo | graph_ppo
+mode: graph_ppo  # ppo | graph_ppo
 device: "cuda:0"
 seed: 0
 

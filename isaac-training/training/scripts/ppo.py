@@ -156,7 +156,7 @@ class PPO(TensorDictModuleBase):
         """Graph PPO forward: topology graph → probs → node → world velocity."""
         node_features  = tensordict["agents", "observation", "node_features"]   # (B, N+1, 18)
         node_positions = tensordict["agents", "observation", "node_positions"]  # (B, N+1, 3)
-        edge_features  = tensordict["agents", "observation", "edge_features"]   # (B, N+1, N+1, 7)
+        edge_features  = tensordict["agents", "observation", "edge_features"]   # (B, N+1, N+1, 8)
         node_mask      = tensordict["agents", "observation", "node_mask"].bool()  # (B, N+1)
         edge_mask      = tensordict["agents", "observation", "edge_mask"].bool()  # (B, N+1, N+1)
         drone_state    = tensordict["agents", "observation", "state"]           # (B, 8)
@@ -192,8 +192,13 @@ class PPO(TensorDictModuleBase):
         tensordict["_graph_action"]   = action_idx   # (B,) discrete node index – used in _update
         tensordict["sample_log_prob"] = log_prob      # (B,)
         tensordict["state_value"]     = value         # (B, 1)
-        # Set velocity action → VelController will convert to motor thrust
-        tensordict["agents", "action"] = vel_w.unsqueeze(1)  # (B, 1, 3)
+        # Cache raw velocity so _pre_sim_step_graph can read it AFTER VelController runs.
+        # VelController._inv_call overwrites ("agents","action") with motor thrusts before
+        # _pre_sim_step is called, so reading from ("agents","action") inside _pre_sim_step
+        # would give motor thrusts, not the velocity we want for the QP safety filter.
+        tensordict["_v_rl"] = vel_w                   # (B, 3) raw policy velocity
+        # Set velocity: VelController expects (B, 3) and unsqueezes internally to (B, 1, 3)
+        tensordict["agents", "action"] = vel_w        # (B, 3)
         return tensordict
 
     # ------------------------------------------------------------------

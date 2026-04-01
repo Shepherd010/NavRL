@@ -33,7 +33,7 @@ class TopoExtractor:
         self.safe_radius = cfg.safe_radius         # 0.4 m
         self.grad_threshold = cfg.grad_threshold   # 0.5
         self.node_feat_dim = cfg.node_feat_dim     # 18
-        self.edge_feat_dim = cfg.edge_feat_dim     # 7
+        self.edge_feat_dim = cfg.edge_feat_dim     # 8 (rel_pos×3 + elen×1 + dyn_norm×1 + dir×3)
         self.lidar_range = cfg.lidar_range         # 10.0
         self.grid_size   = cfg.grid_size           # 100
         self.nms_radius  = cfg.nms_radius          # 0.5
@@ -113,7 +113,7 @@ class TopoExtractor:
         # ---------- 6. Edge features ----------
         edge_features = self._encode_edge_features(
             node_positions, edges, edge_lengths, dyn_obs, full_node_mask
-        )  # (B, N+1, N+1, 7)
+        )  # (B, N+1, N+1, 8)
 
         return {
             "node_features":  node_features,
