@@ -47,8 +47,9 @@ def main(cfg):
     transformed_env.set_seed(cfg.seed)
 
     # Inject lee_controller for graph_ppo mode (same fix as train.py)
-    if env.use_topo:
-        env.lee_controller = controller
+    if getattr(env, 'use_topo', False) or (hasattr(env, 'base_env') and getattr(env.base_env, 'use_topo', False)):
+        base_env = env.base_env if hasattr(env, 'base_env') else env
+        base_env.lee_controller = controller
 
     # PPO Policy
     _topo_cfg = cfg.topo if getattr(cfg, 'mode', 'ppo') == 'graph_ppo' else None

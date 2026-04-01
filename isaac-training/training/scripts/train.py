@@ -51,8 +51,10 @@ def main(cfg):
     # Inject the same LeePositionController into env so that _pre_sim_step_graph can
     # convert ctrl_vel → motor thrusts directly (VelController runs before _pre_sim_step,
     # so we cannot rely on it inside _pre_sim_step).
-    if env.use_topo:
-        env.lee_controller = controller
+    if getattr(env, 'use_topo', False) or (hasattr(env, 'base_env') and getattr(env.base_env, 'use_topo', False)):
+        # torchrl TransformedEnv wraps the real env, we need to access base_env
+        base_env = env.base_env if hasattr(env, 'base_env') else env
+        base_env.lee_controller = controller
 
     # PPO Policy (pass topo_cfg when graph_ppo mode is active)
     _topo_cfg = cfg.topo if getattr(cfg, 'mode', 'ppo') == 'graph_ppo' else None
