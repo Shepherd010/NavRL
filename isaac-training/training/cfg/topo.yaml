@@ -22,6 +22,7 @@ topo:
   num_layers: 3
   dropout: 0.1
   use_spd_bias: true             # use shortest path distance bias in attention
+  value_chunk_size: 256          # chunk size for _compute_values to avoid O(N^2) edge OOM
 
   # ----- node_to_velocity -----
   v_target: 2.0                  # cruise speed (m/s)

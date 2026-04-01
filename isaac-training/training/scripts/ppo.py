@@ -209,21 +209,34 @@ class PPO(TensorDictModuleBase):
     # ------------------------------------------------------------------
 
     def _compute_values(self, tensordict):
-        """Compute value estimate – handles arbitrary batch shape (B,) or (B, T)."""
+        """Compute value estimate – handles arbitrary batch shape (B,) or (B, T).
+        Graph path processes in chunks to avoid O(N²) edge memory explosion.
+        """
         if self.graph_ppo:
             orig_shape = tensordict.batch_size          # e.g. (B,) or (B, T)
             flat_td    = tensordict.reshape(-1)          # always (B*T,)
+            total      = flat_td.batch_size[0]
+            chunk_size = int(getattr(self.topo_cfg, 'value_chunk_size', 256))
 
             node_features = flat_td["agents", "observation", "node_features"]
             edge_features = flat_td["agents", "observation", "edge_features"]
             node_mask     = flat_td["agents", "observation", "node_mask"].bool()
             edge_mask     = flat_td["agents", "observation", "edge_mask"].bool()
             drone_state   = flat_td["agents", "observation", "state"]
+
+            chunks = []
             with torch.no_grad():
-                _, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask)
-                h_ego  = h[:, 0, :]                        # (B*T, hidden_dim)
-                values = self.graph_critic_mlp(torch.cat([h_ego, drone_state], dim=-1))  # (B*T, 1)
-            return values.view(*orig_shape, 1)         # restore batch shape
+                for start in range(0, total, chunk_size):
+                    end = min(start + chunk_size, total)
+                    _, h = self.graph_transformer(
+                        node_features[start:end], edge_features[start:end],
+                        node_mask[start:end],     edge_mask[start:end],
+                    )
+                    h_ego = h[:, 0, :]              # (chunk, hidden_dim)
+                    v = self.graph_critic_mlp(torch.cat([h_ego, drone_state[start:end]], dim=-1))
+                    chunks.append(v)
+            values = torch.cat(chunks, dim=0)       # (B*T, 1)
+            return values.view(*orig_shape, 1)      # restore batch shape
         else:
             self.feature_extractor(tensordict)
             return self.critic(tensordict)["state_value"]
