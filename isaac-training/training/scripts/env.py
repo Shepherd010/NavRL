@@ -1,6 +1,7 @@
 import torch
 import einops
 import numpy as np
+from omegaconf import OmegaConf
 from tensordict.tensordict import TensorDict, TensorDictBase
 from torchrl.data import UnboundedContinuousTensorSpec, CompositeSpec, DiscreteTensorSpec
 from omni_drones.envs.isaac_env import IsaacEnv, AgentSpec
@@ -44,8 +45,9 @@ class NavigationEnv(IsaacEnv):
         # the velocity from tensordict["agents","action"] after VelController has already
         # replaced it with motor thrusts).
         self.use_topo = (
-            hasattr(cfg, 'topo') and cfg.topo.use_topo
-            and getattr(cfg, 'mode', 'ppo') == 'graph_ppo'
+            OmegaConf.select(cfg, 'topo', default=None) is not None
+            and OmegaConf.select(cfg, 'topo.use_topo', default=False)
+            and OmegaConf.select(cfg, 'mode', default='ppo') == 'graph_ppo'
         )
 
         super().__init__(cfg, cfg.headless)
@@ -340,35 +342,33 @@ class NavigationEnv(IsaacEnv):
         observation_dim = 8
         num_dim_each_dyn_obs_state = 10
 
+        # Build base observation sub-spec (before expand)
+        obs_spec_dict = {
+            "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device),
+            "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
+            "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
+            "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
+        }
+
+        # Optional graph observation keys — must be added BEFORE expand() so that
+        # the batch dimension is correctly prepended by expand(num_envs).
+        if self.use_topo:
+            _N  = self.cfg.topo.max_nodes       # candidate nodes (ego excluded)
+            _nf = self.cfg.topo.node_feat_dim   # 18
+            _ef = self.cfg.topo.edge_feat_dim   # 8
+            obs_spec_dict["node_features"]  = UnboundedContinuousTensorSpec((_N + 1, _nf), device=self.device)
+            obs_spec_dict["node_positions"] = UnboundedContinuousTensorSpec((_N + 1, 3), device=self.device)
+            obs_spec_dict["edge_features"]  = UnboundedContinuousTensorSpec((_N + 1, _N + 1, _ef), device=self.device)
+            # masks stored as float (0.0/1.0) – cast to bool before use in GraphTransformer
+            obs_spec_dict["node_mask"] = UnboundedContinuousTensorSpec((_N + 1,), device=self.device)
+            obs_spec_dict["edge_mask"] = UnboundedContinuousTensorSpec((_N + 1, _N + 1), device=self.device)
+
         # Observation Spec
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
-                "observation": CompositeSpec({
-                    "state": UnboundedContinuousTensorSpec((observation_dim,), device=self.device), 
-                    "lidar": UnboundedContinuousTensorSpec((1, self.lidar_hbeams, self.lidar_vbeams), device=self.device),
-                    "direction": UnboundedContinuousTensorSpec((1, 3), device=self.device),
-                    "dynamic_obstacle": UnboundedContinuousTensorSpec((1, self.cfg.algo.feature_extractor.dyn_obs_num, num_dim_each_dyn_obs_state), device=self.device),
-                }),
+                "observation": CompositeSpec(obs_spec_dict),
             }).expand(self.num_envs)
         }, shape=[self.num_envs], device=self.device)
-        
-        # Optional graph observation keys (added before action spec)
-        if self.use_topo:
-            _N = self.cfg.topo.max_nodes        # candidate nodes (ego excluded)
-            _nf = self.cfg.topo.node_feat_dim   # 18
-            _ef = self.cfg.topo.edge_feat_dim   # 7
-            # Inject into the existing observation CompositeSpec
-            self.observation_spec["agents"]["observation"]["node_features"]  = \
-                UnboundedContinuousTensorSpec((_N + 1, _nf), device=self.device)
-            self.observation_spec["agents"]["observation"]["node_positions"] = \
-                UnboundedContinuousTensorSpec((_N + 1, 3), device=self.device)
-            self.observation_spec["agents"]["observation"]["edge_features"]  = \
-                UnboundedContinuousTensorSpec((_N + 1, _N + 1, _ef), device=self.device)
-            # masks stored as float (0.0 / 1.0) – cast to bool before use in GraphTransformer
-            self.observation_spec["agents"]["observation"]["node_mask"] = \
-                UnboundedContinuousTensorSpec((_N + 1,), device=self.device)
-            self.observation_spec["agents"]["observation"]["edge_mask"] = \
-                UnboundedContinuousTensorSpec((_N + 1, _N + 1), device=self.device)
 
         # Action Spec
         self.action_spec = CompositeSpec({

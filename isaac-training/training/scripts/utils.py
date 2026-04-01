@@ -5,7 +5,7 @@ import numpy as np
 from typing import Iterable, Union
 from tensordict.tensordict import TensorDict
 from omni_drones.utils.torchrl import RenderCallback
-from torchrl.envs.utils import ExplorationType, set_exploration_type
+from torchrl.envs.utils import ExplorationType, set_exploration_type, step_mdp
 
 class ValueNorm(nn.Module):
     def __init__(
@@ -162,54 +162,76 @@ def evaluate(
     env,
     policy,
     cfg,
-    seed: int=0, 
-    exploration_type: ExplorationType=ExplorationType.MEAN
+    seed: int=0,
+    exploration_type: ExplorationType=ExplorationType.MEAN,
+    eval_num_envs: int=None,
+    eval_max_steps: int=None,
 ):
+    """Memory-efficient evaluation.
 
+    Instead of env.rollout() which accumulates (num_envs × max_steps) full
+    observations in GPU memory, we step manually and keep only scalar stats.
+    Only the first `eval_num_envs` environments are counted; the physics for
+    the remaining envs still runs (Isaac Sim env size is fixed) but their
+    data is discarded immediately.
+    """
     env.enable_render(True)
     env.eval()
     env.set_seed(seed)
 
+    n     = eval_num_envs or env.num_envs   # number of envs we care about
+    steps = eval_max_steps or env.max_episode_length
+
     render_callback = RenderCallback(interval=2)
-    
+
+    # per-env accumulators: record stats at the moment each env first finishes
+    first_done_recorded = torch.zeros(n, dtype=torch.bool)   # CPU
+    first_stats: dict[str, torch.Tensor] = {}
+
+    td = env.reset()
+
     with set_exploration_type(exploration_type):
-        trajs = env.rollout(
-            max_steps=env.max_episode_length,
-            policy=policy,
-            callback=render_callback,
-            auto_reset=True,
-            break_when_any_done=False,
-            return_contiguous=False,
-        )
-    # base_env.enable_render(not cfg.headless)
+        for step in range(steps):
+            render_callback(env, td, step)          # capture video frame
+
+            td = policy(td)                         # forward (no_grad from decorator)
+            td = env.step(td)
+            next_td = td.get("next")
+
+            # ── slice to first n envs ──────────────────────────────────────
+            done  = next_td.get("done")[:n].squeeze(-1).cpu()   # (n,)
+            stats = next_td.get("stats", {})
+
+            new_done = done & ~first_done_recorded
+            if new_done.any():
+                for k, v in stats.items():
+                    val = v[:n].float().cpu()                   # (n, ...)
+                    if k not in first_stats:
+                        first_stats[k] = torch.zeros(n)
+                    first_stats[k][new_done] = val[new_done].reshape(new_done.sum(), -1)[:, 0]
+
+            first_done_recorded |= done
+
+            # reset done envs and advance td for next step
+            td = step_mdp(td)
+
+            if first_done_recorded.all():
+                break
+
     env.enable_render(not cfg.headless)
     env.reset()
-    
-    done = trajs.get(("next", "done")) 
-    first_done = torch.argmax(done.long(), dim=1).cpu() # idx of first done will be return for each trajs
-
-    def take_first_episode(tensor: torch.Tensor):
-        indices = first_done.reshape(first_done.shape+(1,)*(tensor.ndim-2))
-        return torch.take_along_dim(tensor, indices, dim=1).reshape(-1)
-
-    traj_stats = {
-        k: take_first_episode(v)
-        for k, v in trajs[("next", "stats")].cpu().items()
-    }
 
     info = {
-        "eval/stats." + k: torch.mean(v.float()).item() 
-        for k, v in traj_stats.items()
+        "eval/stats." + k: v.mean().item()
+        for k, v in first_stats.items()
     }
 
-    # log video
     info["recording"] = wandb.Video(
-        render_callback.get_video_array(axes="t c h w"), 
-        fps=0.5 / (cfg.sim.dt * cfg.sim.substeps), 
+        render_callback.get_video_array(axes="t c h w"),
+        fps=0.5 / (cfg.sim.dt * cfg.sim.substeps),
         format="mp4"
     )
     env.train()
-    # env.reset()
 
     return info
 

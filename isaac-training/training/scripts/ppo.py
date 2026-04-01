@@ -152,8 +152,11 @@ class PPO(TensorDictModuleBase):
         tensordict["agents", "action"] = actions_world
         return tensordict
 
+    @torch.no_grad()
     def _forward_graph(self, tensordict):
         """Graph PPO forward: topology graph → probs → node → world velocity."""
+        # @torch.no_grad(): rollout collection only needs sampled actions/values as data;
+        # _update_graph does a fresh differentiable forward pass during training.
         node_features  = tensordict["agents", "observation", "node_features"]   # (B, N+1, 18)
         node_positions = tensordict["agents", "observation", "node_positions"]  # (B, N+1, 3)
         edge_features  = tensordict["agents", "observation", "edge_features"]   # (B, N+1, N+1, 8)
@@ -189,7 +192,7 @@ class PPO(TensorDictModuleBase):
         value     = self.graph_critic_mlp(torch.cat([h_ego, drone_state], dim=-1))  # (B, 1)
 
         # Store in tensordict
-        tensordict["_graph_action"]   = action_idx   # (B,) discrete node index – used in _update
+        tensordict["graph_action"]    = action_idx   # (B,) discrete node index – used in _update
         tensordict["sample_log_prob"] = log_prob      # (B,)
         tensordict["state_value"]     = value         # (B, 1)
         # Cache raw velocity so _pre_sim_step_graph can read it AFTER VelController runs.
@@ -218,8 +221,8 @@ class PPO(TensorDictModuleBase):
             drone_state   = flat_td["agents", "observation", "state"]
             with torch.no_grad():
                 _, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask)
-            h_ego  = h[:, 0, :]                        # (B*T, hidden_dim)
-            values = self.graph_critic_mlp(torch.cat([h_ego, drone_state], dim=-1))  # (B*T, 1)
+                h_ego  = h[:, 0, :]                        # (B*T, hidden_dim)
+                values = self.graph_critic_mlp(torch.cat([h_ego, drone_state], dim=-1))  # (B*T, 1)
             return values.view(*orig_shape, 1)         # restore batch shape
         else:
             self.feature_extractor(tensordict)
@@ -253,7 +256,7 @@ class PPO(TensorDictModuleBase):
         for epoch in range(self.cfg.training_epoch_num):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
             for minibatch in batch:
-                infos.append(self._update(minibatch))
+                infos.append(self._update(minibatch).to('cpu'))
         infos = torch.stack(infos).to_tensordict()
         infos = infos.apply(torch.mean, batch_size=[])
         return {k: v.item() for k, v in infos.items()}
@@ -274,7 +277,7 @@ class PPO(TensorDictModuleBase):
 
         probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask)
         dist           = Categorical(probs=probs)
-        log_probs      = dist.log_prob(tensordict["_graph_action"])  # (B,)
+        log_probs      = dist.log_prob(tensordict["graph_action"])   # (B,)
         action_entropy = dist.entropy()                             # (B,)
 
         # Critic
@@ -300,7 +303,7 @@ class PPO(TensorDictModuleBase):
         critic_loss  = torch.max(self.critic_loss_fn(ret, value_clipped), self.critic_loss_fn(ret, value))
 
         loss = entropy_loss + actor_loss + critic_loss
-        self.graph_optim.zero_grad()
+        self.graph_optim.zero_grad(set_to_none=True)
         loss.backward()
         all_params = list(self.graph_transformer.parameters()) + list(self.graph_critic_mlp.parameters())
         grad_norm  = nn.utils.clip_grad.clip_grad_norm_(all_params, max_norm=5.)
@@ -338,9 +341,9 @@ class PPO(TensorDictModuleBase):
         critic_loss  = torch.max(self.critic_loss_fn(ret, value_clipped), self.critic_loss_fn(ret, value))
 
         loss = entropy_loss + actor_loss + critic_loss
-        self.feature_extractor_optim.zero_grad()
-        self.actor_optim.zero_grad()
-        self.critic_optim.zero_grad()
+        self.feature_extractor_optim.zero_grad(set_to_none=True)
+        self.actor_optim.zero_grad(set_to_none=True)
+        self.critic_optim.zero_grad(set_to_none=True)
         loss.backward()
         actor_grad_norm  = nn.utils.clip_grad.clip_grad_norm_(self.actor.parameters(), max_norm=5.)
         critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.critic.parameters(), max_norm=5.)

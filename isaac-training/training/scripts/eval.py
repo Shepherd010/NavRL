@@ -52,7 +52,7 @@ def main(cfg):
         base_env.lee_controller = controller
 
     # PPO Policy
-    _topo_cfg = cfg.topo if getattr(cfg, 'mode', 'ppo') == 'graph_ppo' else None
+    _topo_cfg = OmegaConf.select(cfg, 'topo', default=None) if OmegaConf.select(cfg, 'mode', default='ppo') == 'graph_ppo' else None
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
                  topo_cfg=_topo_cfg)
 

@@ -57,7 +57,7 @@ def main(cfg):
         base_env.lee_controller = controller
 
     # PPO Policy (pass topo_cfg when graph_ppo mode is active)
-    _topo_cfg = cfg.topo if getattr(cfg, 'mode', 'ppo') == 'graph_ppo' else None
+    _topo_cfg = OmegaConf.select(cfg, 'topo', default=None) if OmegaConf.select(cfg, 'mode', default='ppo') == 'graph_ppo' else None
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
                  topo_cfg=_topo_cfg)
 
@@ -92,6 +92,7 @@ def main(cfg):
 
         # Train Policy
         train_loss_stats = policy.train(data)
+        torch.cuda.empty_cache()   # release fragmented CUDA allocator blocks after training step
         info.update(train_loss_stats) # log training loss info
 
         # Calculate and log training episode stats
@@ -106,16 +107,15 @@ def main(cfg):
         # Evaluate policy and log info
         if i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
-            env.enable_render(True)
-            env.eval()
             eval_info = evaluate(
                 env=transformed_env, 
                 policy=policy,
                 seed=cfg.seed, 
                 cfg=cfg,
-                exploration_type=ExplorationType.MEAN
+                exploration_type=ExplorationType.MEAN,
+                eval_num_envs=cfg.eval.num_envs,
+                eval_max_steps=cfg.eval.max_episode_length,
             )
-            env.enable_render(not cfg.headless)
             env.train()
             env.reset()
             info.update(eval_info)

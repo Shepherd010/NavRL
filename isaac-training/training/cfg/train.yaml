@@ -22,6 +22,11 @@ env:
   env_spacing: 8.0 
   num_obstacles: 350
 
+# Evaluation Environment (uses the same Isaac Sim env but only counts first N envs)
+eval:
+  num_envs: 2          # envs counted for stats (≤ env.num_envs, set lower to save VRAM)
+  max_episode_length: 500  # shorter cap; exit early once all eval envs finish one episode
+
 env_dyn:
   num_obstacles: 80 # set to zero if static env is needed
   vel_range: [0.5, 1.5]
