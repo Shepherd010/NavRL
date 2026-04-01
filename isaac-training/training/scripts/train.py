@@ -24,25 +24,16 @@ def main(cfg):
     sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
 
     # Use Wandb to monitor training
-    if (cfg.wandb.run_id is None):
-        run = wandb.init(
-            project=cfg.wandb.project,
-            name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
-            mode=cfg.wandb.mode,
-            id=wandb.util.generate_id(),
-        )
-    else:
-        run = wandb.init(
-            project=cfg.wandb.project,
-            name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
-            entity=cfg.wandb.entity,
-            config=cfg,
-            mode=cfg.wandb.mode,
-            id=cfg.wandb.run_id,
-            resume="must"
-        )
+    run_id = cfg.wandb.get("run_id")
+    run = wandb.init(
+        project=cfg.wandb.project,
+        name=f"{cfg.wandb.name}/{datetime.datetime.now().strftime('%m-%d_%H-%M')}",
+        entity=cfg.wandb.entity,
+        config=OmegaConf.to_container(cfg, resolve=True),
+        mode=cfg.wandb.mode,
+        id=run_id if run_id is not None else wandb.util.generate_id(),
+        resume="must" if run_id is not None else None,
+    )
 
     # Navigation Training Environment
     from env import NavigationEnv

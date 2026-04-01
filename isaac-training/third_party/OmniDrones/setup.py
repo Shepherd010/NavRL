@@ -8,7 +8,7 @@ setup(
     install_requires=[
         "hydra-core",
         "omegaconf",
-        "wandb==0.12.21",
+        "wandb>=0.12.21",
         "moviepy",
         "imageio",
         "plotly",

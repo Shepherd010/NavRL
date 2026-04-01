@@ -14,6 +14,22 @@ import warp as wp
 from omni.isaac.orbit.utils.warp import raycast_mesh
 
 
+def _resolve_color_map(color_map: str):
+    """Resolve a trimesh-compatible colormap, with optional matplotlib fallback."""
+    try:
+        trimesh.visual.color.interpolate([0.0, 1.0], color_map=color_map)
+        return color_map
+    except ValueError:
+        pass
+
+    try:
+        import matplotlib.pyplot as plt
+
+        return plt.get_cmap(color_map)
+    except Exception:
+        return "viridis"
+
+
 def color_meshes_by_height(meshes: list[trimesh.Trimesh], **kwargs) -> trimesh.Trimesh:
     """
     Color the vertices of a trimesh object based on the z-coordinate (height) of each vertex,
@@ -48,7 +64,7 @@ def color_meshes_by_height(meshes: list[trimesh.Trimesh], **kwargs) -> trimesh.T
         # clip lower and upper bounds to have better color mapping
         heights_normalized = np.clip(heights_normalized, 0.1, 0.9)
         # Get the color for each vertex based on the height
-        color_map = kwargs.pop("color_map", "turbo")
+        color_map = _resolve_color_map(kwargs.pop("color_map", "turbo"))
         colors = trimesh.visual.color.interpolate(heights_normalized, color_map=color_map)
         # Set the vertex colors
         mesh.visual.vertex_colors = colors
