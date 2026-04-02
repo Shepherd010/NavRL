@@ -729,8 +729,9 @@ class NavigationEnv(IsaacEnv):
         # c2. progress reward: positive when drone moves closer to goal this step
         #     clamped to 0 so no penalty for moving away (reward_vel already handles that)
         #     inf on first step after reset → clamp produces 0 (safe)
-        reward_progress = (self.prev_target_distance - distance).clamp(min=0.)  # (B, 1)
-        self.prev_target_distance = distance.clone()
+        distance_for_reward = distance.squeeze(1)  # (B, 1)
+        reward_progress = (self.prev_target_distance - distance_for_reward).clamp(min=0.)  # (B, 1)
+        self.prev_target_distance = distance_for_reward.clone()
 
         # d. smoothness reward for action smoothness
         penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
@@ -788,7 +789,7 @@ class NavigationEnv(IsaacEnv):
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
-        self.stats["distance_to_goal"] = distance
+        self.stats["distance_to_goal"] = distance.squeeze(1)
         self.stats["speed"] = self.drone.vel_w[..., :3].norm(dim=-1, keepdim=True)
         self.stats["reward_vel"] = reward_vel
         self.stats["reward_progress"] = reward_progress
