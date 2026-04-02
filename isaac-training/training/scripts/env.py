@@ -714,80 +714,91 @@ class NavigationEnv(IsaacEnv):
 
 
         # -----------------Reward Calculation-----------------
-        # NOTE: In graph_ppo mode, physical safety is enforced by SafetyShieldQP at the
-        # control level (hard CBF constraint). The RL reward therefore does NOT need a
-        # safety bonus — adding one causes hovering because log(lidar_range - scan) is
-        # positive when surrounded by obstacles and very negative in open space, so the
-        # agent learns to stay still inside obstacle clusters to maximise safety reward.
-        # Instead: only penalise actual collisions, and strongly reward goal progress.
+        # Design: approaching the goal is the ABSOLUTE core. All terms are scaled to
+        # meaningful magnitudes so each component is clearly felt by the optimizer.
+        #
+        # Expected per-step value ranges (v_max=2 m/s, dt≈0.02 s → max Δd≈0.04 m):
+        #   reward_progress : ±8        BIDIRECTIONAL — penalty when retreating (CORE)
+        #   reward_vel      : ±20       speed projected on goal direction
+        #   approach_bonus  : 1 – 50    dense inverse-distance potential, always pulls toward goal
+        #   reach_goal_bonus: 500       terminal success (fires once, then episode resets)
+        #   collision       : −200      severe episode-ending penalty
+        #   penalty_smooth  : ≈ −2      regularisation against jerky motion
+        #   penalty_height  : large     quadratic OOB penalty ×20
 
-        # a. safety reward kept only for logging (weight = 0)
-        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+        # a. Safety rewards — kept for logging only, weight = 0 in final sum.
+        #    (Adding safety reward to RL objective causes hovering near obstacles.)
+        reward_safety_static = torch.log((self.lidar_range - self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
 
-        # b. safety reward for dynamic obstacles (logging only)
         if (self.cfg.env_dyn.num_obstacles != 0):
             reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
         else:
             reward_safety_dynamic = torch.zeros(self.num_envs, 1, device=self.cfg.device)
 
-        # c. velocity reward — speed projected onto goal direction (primary signal)
-        vel_direction = rpos / distance.clamp_min(1e-6)
-        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)  # (B, 1)
-
-        # d. progress reward — actual distance reduction this step (dense shaping)
-        #    clamped to 0: no penalty for moving away, reward_vel handles that
-        #    inf on first step after reset → clamp gives 0 (safe)
-        distance_for_reward = distance.squeeze(1)  # (B, 1)
-        reward_progress = (self.prev_target_distance - distance_for_reward).clamp(min=0.)  # (B, 1)
+        # b. CORE — Bidirectional progress: reward approaching, PENALISE retreating.
+        #    delta_d > 0: drone got closer this step → reward
+        #    delta_d < 0: drone moved farther away   → penalty  (critical new signal)
+        #    Guard the first step after reset where prev_target_distance = inf.
+        distance_for_reward = distance.squeeze(1)                                           # (B, 1)
+        valid_progress = (self.prev_target_distance < 1e6)                                  # (B, 1) bool
+        delta_d = (self.prev_target_distance - distance_for_reward) * valid_progress.float()  # (B, 1) meters
         self.prev_target_distance = distance_for_reward.clone()
+        reward_progress = delta_d * 200.0   # ±8 / step at v_max; negative when retreating
 
-        # e. smoothness penalty
-        penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
-        
-        # f. height penalty
+        # c. Velocity projected onto goal direction — continuous directional signal.
+        #    Positive when flying toward goal, negative when flying away.
+        vel_direction = rpos / distance.clamp_min(1e-6)                                    # unit vector (B, 1, 3)
+        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)                   # (B, 1), ∈ [−v_max, +v_max]
+
+        # d. Inverse-distance potential — dense pull at ALL distances.
+        #    F(d) = 50 / (d + 1):  d=0.5m→33,  d=5m→8.3,  d=20m→2.4,  d=48m→1.0
+        #    Works from the very first step (no cold-start dead zone unlike 1/d²).
+        approach_bonus = 50.0 / (distance_for_reward + 1.0)                                # (B, 1)
+
+        # e. Smoothness penalty — jerk regularisation.
+        penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)  # (B, 1)
+
+        # f. Height penalty — quadratic when outside allowed band.
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
-        penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
-        penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
+        penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = (
+            (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2) ** 2
+        )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
+        penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = (
+            (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2]) ** 2
+        )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
 
-        # g. collision detection
-        static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
+        # g. Collision detection.
+        static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") > (self.lidar_range - 0.3)
         collision = static_collision | dynamic_collision
 
-        # h. goal reached bonus (one-time: episode will terminate this step)
-        reach_goal = (distance_for_reward < 0.5)  # (B, 1) bool
-        reach_goal_bonus = reach_goal.float() * 50.0
+        # h. Reach-goal terminal bonus — large enough to make success unambiguously worth it.
+        #    Threshold expanded to 1.0 m so the gradient "turns on" slightly earlier.
+        reach_goal = (distance_for_reward < 1.0)         # (B, 1) bool
+        reach_goal_bonus = reach_goal.float() * 500.0    # fires once, episode resets immediately
 
-        # i. Continuous approach shaping: 2/(d+0.5) — smoothly increases as drone nears goal.
-        #    Unlike a step-function (was: (d<2m)*1), this gives non-zero gradient at ALL
-        #    distances and prevents the "outside-2m plateau" where the policy stalls.
-        #    At d=0 (goal): 4.0; at d=1.5m: ~1.14; at d=5m: ~0.36; at d=20m: ~0.10.
-        #    Weight=2.0 chosen so at d=0 the bonus is 8.0 — just below reach_goal_bonus/6
-        #    and large enough to dominate random movement (reward_vel mean ≈ 2–3 in early training).
-        approach_bonus = 2.0 / (distance_for_reward + 0.5)  # (B, 1), always positive
+        # ==== Final reward ====
+        # reward_progress   CORE bidirectional: ±200 × Δd ≈ ±8 / step
+        # reward_vel ×10    velocity toward goal: ±20
+        # approach_bonus    50/(d+1): dense potential, 1–50
+        # reach_goal_bonus  500 terminal success (one-time)
+        # collision  ×−200  severe penalty (episode-ending)
+        # penalty_smooth ×−2  jerk regularisation
+        # penalty_height ×−20 quadratic OOB
+        self.reward = (
+              reward_progress                   # CORE: bidirectional, ±8 / step
+            + reward_vel * 10.0                 # velocity direction guide: ±20
+            + approach_bonus                    # dense distance shaping: 1–50
+            + reach_goal_bonus                  # terminal success: 500
+            - collision.float() * 200.0         # collision: −200
+            - penalty_smooth * 2.0              # jerk regularisation
+            - penalty_height * 20.0             # height OOB constraint
+        )
 
-        # Final reward calculation
-        # Weight rationale:
-        #   reward_vel      ×5.0   — primary signal: speed toward goal (qp_v_max=2 → max ≈10)
-        #   reward_progress ×20.0  — dense shaping: actual step displacement (0.04m/step ≈ 0.8)
-        #   reach_goal_bonus 50.0  — terminal bonus, fires once when episode ends at goal
-        #   approach_bonus  2/(d+0.5) — continuous inverse-dist shaping (max 4 at goal)
-        #   1.0 base           — keeps value baseline positive for ValueNorm stability
-        #   collision         -10  — discourage collisions; QP prevents most but not all
-        #   safety rewards     — ZERO weight (QP layer handles physical safety)
-        self.reward = (reward_vel * 5.0
-                       + reward_progress * 20.0
-                       + reach_goal_bonus
-                       + approach_bonus
-                       + 1.
-                       - collision.float() * 10.0
-                       - penalty_smooth * 0.1
-                       - penalty_height * 8.0)
-
-        # Graph-PPO reward shaping: QP intervention penalty + tracking error penalty
-        # Cached by _pre_sim_step_graph; absent when use_topo=False.
+        # Graph-PPO: QP intervention penalty + tracking error penalty.
+        # Scale lifted to match new reward magnitudes.
         if self.use_topo and hasattr(self, '_last_intervention') and self._last_intervention is not None:
-            I_t     = self._last_intervention                              # (B,)
-            r_intv  = 0.1 * (torch.exp(-I_t ** 2 / (2 * 0.25)) - 1.0)    # small nudge to limit over-intervention
+            I_t     = self._last_intervention                                      # (B,)
+            r_intv  = 2.0 * (torch.exp(-I_t ** 2 / (2 * 0.25)) - 1.0)            # ∈ [−2, 0]
             track_w = float(self.cfg.topo.reward_tracking_weight)
             self.reward = self.reward \
                 + r_intv.unsqueeze(-1) \
