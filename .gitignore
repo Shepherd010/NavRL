@@ -110,7 +110,7 @@ isaac-training/third_party/warp/_build/
 
 isaac-training/outputs/
 # Specifically requested ignores
-training/outputs/
-training/wandb/
-training_old/outputs/
-training_old/wandb/
+isaac-training/training/outputs/
+isaac-training/training/wandb/
+isaac-training/training_old/outputs/
+isaac-training/training_old/wandb/
