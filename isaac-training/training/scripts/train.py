@@ -21,7 +21,7 @@ FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
 @hydra.main(config_path=FILE_PATH, config_name="train", version_base=None)
 def main(cfg):
     # Simulation App
-    sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 1})
+    sim_app = SimulationApp({"headless": cfg.headless, "anti_aliasing": 0})
 
     # Use Wandb to monitor training
     run_id = cfg.wandb.get("run_id")
@@ -84,15 +84,16 @@ def main(cfg):
     )
 
     # Training Loop
+    log_interval = int(OmegaConf.select(cfg, 'log_interval', default=10))  # log every N steps
     for i, data in enumerate(collector):
-        # print("data: ", data)
-        # print("============================")
         # Log Info
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
 
         # Train Policy
         train_loss_stats = policy.train(data)
-        torch.cuda.empty_cache()   # release fragmented CUDA allocator blocks after training step
+        # NOTE: torch.cuda.empty_cache() removed — it forces all fragmented blocks back to
+        # CUDA, destroying PyTorch's allocator pool locality, which causes re-allocation on
+        # the next step and is measurably slower. Only call it before eval if needed.
         info.update(train_loss_stats) # log training loss info
 
         # Log real-time training status from the latest frame in this batch.
@@ -117,6 +118,7 @@ def main(cfg):
         # Evaluate policy and log info
         if i > 0 and i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
+            torch.cuda.empty_cache()  # safe to call here: before eval, VRAM matters
             eval_info = evaluate(
                 env=transformed_env, 
                 policy=policy,
@@ -131,9 +133,9 @@ def main(cfg):
             info.update(eval_info)
             print("\n[NavRL]: evaluation done.")
         
-        # Update wand info
-        run.log(info)
-
+        # Update wandb — throttled to every log_interval steps to reduce serialisation overhead
+        if i % log_interval == 0:
+            run.log(info, step=i)
 
         # Save Model
         if i % cfg.save_interval == 0:

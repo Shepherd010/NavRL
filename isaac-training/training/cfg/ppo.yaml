@@ -14,5 +14,5 @@ algo:
   
   entropy_loss_coefficient: 1e-3 # encourage exploration
   training_frame_num: 32
-  training_epoch_num: 4
-  num_minibatches: 16 # split into N minibatches
+  training_epoch_num: 2  # 4→2: halves gradient-update time; 32768 diverse samples still sufficient
+  num_minibatches: 8     # 16→8: doubles minibatch size (4096) for better GPU utilisation

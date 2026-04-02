@@ -244,18 +244,27 @@ class PPO(TensorDictModuleBase):
     def train(self, tensordict):
         """PPO training update. Works for both cnn and graph modes."""
         next_tensordict = tensordict["next"]
-        with torch.no_grad():
-            if self.graph_ppo:
-                next_values = self._compute_values(next_tensordict)
-            else:
-                next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict)
-                next_values = self.critic(next_tensordict)["state_value"]
 
         rewards = tensordict["next", "agents", "reward"]
         dones   = tensordict["next", "terminated"]
         values  = tensordict["state_value"].detach()
         values  = self.value_norm.denormalize(values)
-        next_values = self.value_norm.denormalize(next_values)
+
+        if self.graph_ppo:
+            # Shift trick: for t=0..T-2, next_state == state at t+1, so V(s_{t+1})
+            # is already in `values[:,1:]` — no extra forward pass needed.
+            # We only need to compute the bootstrap value V(s_T) for the LAST step.
+            # This reduces _compute_values from 128 chunks → 4 chunks (32× speedup).
+            # Safety: when done=True, GAE multiplies next_value by 0, so any value is fine.
+            next_values = torch.empty_like(values)          # (B, T, 1)
+            next_values[:, :-1] = values[:, 1:]             # shift: already denormalized
+            last_boot = self._compute_values(next_tensordict[:, -1:])  # (B, 1, 1)
+            next_values[:, -1:] = self.value_norm.denormalize(last_boot)
+        else:
+            with torch.no_grad():
+                next_tensordict = torch.vmap(self.feature_extractor)(next_tensordict)
+                next_values = self.critic(next_tensordict)["state_value"]
+            next_values = self.value_norm.denormalize(next_values)
 
         adv, ret = self.gae(rewards, dones, values, next_values)
         adv = (adv - adv.mean()) / adv.std().clip(1e-7)
