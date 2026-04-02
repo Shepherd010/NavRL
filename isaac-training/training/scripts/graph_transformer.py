@@ -226,10 +226,12 @@ class GraphTransformer(nn.Module):
 
         # Mask invalid candidate nodes
         cand_mask = node_mask[:, 1:]   # (B, N)
-        if torch.any(cand_mask.sum(dim=-1) == 0):
-            # Fallback: ensure at least one candidate
+        no_cand = cand_mask.sum(dim=-1) == 0
+        if torch.any(no_cand):
+            # Fallback must only patch rows with zero valid candidates.
+            # Using cand_mask[:, 0] = True would wrongly bias all envs in the batch.
             cand_mask = cand_mask.clone()
-            cand_mask[:, 0] = True
+            cand_mask[no_cand, 0] = True
 
         logits = logits.masked_fill(~cand_mask, -1e9)
         probs  = F.softmax(logits, dim=-1)  # (B, N)

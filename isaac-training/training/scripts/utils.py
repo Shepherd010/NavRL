@@ -192,10 +192,9 @@ def evaluate(
 
     with set_exploration_type(exploration_type):
         for step in range(steps):
-            render_callback(env, td, step)          # capture video frame
-
             td = policy(td)                         # forward (no_grad from decorator)
             td = env.step(td)
+            render_callback(env, td, step)          # capture video frame (after step, buffer is valid)
             next_td = td.get("next")
 
             # ── slice to first n envs ──────────────────────────────────────

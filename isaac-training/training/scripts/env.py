@@ -117,6 +117,8 @@ class NavigationEnv(IsaacEnv):
             self.target_dir = torch.zeros(self.num_envs, 1, 3)
             self.height_range = torch.zeros(self.num_envs, 1, 2)
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
+            # progress reward: track previous distance to goal
+            self.prev_target_distance = torch.full((self.num_envs, 1), float('inf'), device=self.device)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.     
@@ -398,6 +400,16 @@ class NavigationEnv(IsaacEnv):
             "reach_goal": UnboundedContinuousTensorSpec(1),
             "collision": UnboundedContinuousTensorSpec(1),
             "truncated": UnboundedContinuousTensorSpec(1),
+            "distance_to_goal": UnboundedContinuousTensorSpec(1),
+            "speed": UnboundedContinuousTensorSpec(1),
+            "reward_vel": UnboundedContinuousTensorSpec(1),
+            "reward_progress": UnboundedContinuousTensorSpec(1),
+            "reward_safety_static": UnboundedContinuousTensorSpec(1),
+            "reward_safety_dynamic": UnboundedContinuousTensorSpec(1),
+            "penalty_smooth": UnboundedContinuousTensorSpec(1),
+            "penalty_height": UnboundedContinuousTensorSpec(1),
+            "qp_intervention": UnboundedContinuousTensorSpec(1),
+            "tracking_error": UnboundedContinuousTensorSpec(1),
         }).expand(self.num_envs).to(self.device)
 
         info_spec = CompositeSpec({
@@ -480,6 +492,8 @@ class NavigationEnv(IsaacEnv):
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
         self.stats[env_ids] = 0.
+        # reset progress distance so the first step doesn't produce a fake progress bonus
+        self.prev_target_distance[env_ids] = float('inf')
         # pit #5: reset hierarchical controller PID state for terminated envs
         if self.use_topo:
             self.hierarchical_controller.reset_partial(env_ids)
@@ -705,11 +719,19 @@ class NavigationEnv(IsaacEnv):
         # b. safety reward for dynamic obstacles
         if (self.cfg.env_dyn.num_obstacles != 0):
             reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
+        else:
+            reward_safety_dynamic = torch.zeros(self.num_envs, 1, device=self.cfg.device)
 
         # c. velocity reward for goal direction
         vel_direction = rpos / distance.clamp_min(1e-6)
-        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)#.clip(max=2.0)
-        
+        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)  # (B, 1)
+
+        # c2. progress reward: positive when drone moves closer to goal this step
+        #     clamped to 0 so no penalty for moving away (reward_vel already handles that)
+        #     inf on first step after reset → clamp produces 0 (safe)
+        reward_progress = (self.prev_target_distance - distance).clamp(min=0.)  # (B, 1)
+        self.prev_target_distance = distance.clone()
+
         # d. smoothness reward for action smoothness
         penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
         
@@ -724,10 +746,15 @@ class NavigationEnv(IsaacEnv):
         collision = static_collision | dynamic_collision
         
         # Final reward calculation
+        # Weight rationale:
+        #   reward_vel      ×2.0  — primary signal: speed toward goal (max ~2.0*2=4.0)
+        #   reward_progress ×5.0  — dense shaping: actual displacement toward goal (max ~0.03m per step ≈0.15)
+        #   reward_safety   ×0.3  — safety bonus (log(10)≈2.3 → 0.7), no longer dominates
+        #   1.0 base keeps returns positive so value-norm is stable
         if (self.cfg.env_dyn.num_obstacles != 0):
-            self.reward = reward_vel + 1. + reward_safety_static * 1.0 + reward_safety_dynamic * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+            self.reward = reward_vel * 2.0 + reward_progress * 5.0 + 1. + reward_safety_static * 0.3 + reward_safety_dynamic * 0.3 - penalty_smooth * 0.1 - penalty_height * 8.0
         else:
-            self.reward = reward_vel + 1. + reward_safety_static * 1.0 - penalty_smooth * 0.1 - penalty_height * 8.0
+            self.reward = reward_vel * 2.0 + reward_progress * 5.0 + 1. + reward_safety_static * 0.3 - penalty_smooth * 0.1 - penalty_height * 8.0
 
         # Graph-PPO reward shaping: QP intervention penalty + tracking error penalty
         # Cached by _pre_sim_step_graph; absent when use_topo=False.
@@ -761,6 +788,20 @@ class NavigationEnv(IsaacEnv):
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
+        self.stats["distance_to_goal"] = distance
+        self.stats["speed"] = self.drone.vel_w[..., :3].norm(dim=-1, keepdim=True)
+        self.stats["reward_vel"] = reward_vel
+        self.stats["reward_progress"] = reward_progress
+        self.stats["reward_safety_static"] = reward_safety_static
+        self.stats["reward_safety_dynamic"] = reward_safety_dynamic
+        self.stats["penalty_smooth"] = penalty_smooth
+        self.stats["penalty_height"] = penalty_height
+        if self.use_topo and hasattr(self, '_last_intervention') and self._last_intervention is not None:
+            self.stats["qp_intervention"] = self._last_intervention.unsqueeze(-1)
+            self.stats["tracking_error"] = self._last_tracking_error.unsqueeze(-1)
+        else:
+            self.stats["qp_intervention"] = torch.zeros(self.num_envs, 1, device=self.cfg.device)
+            self.stats["tracking_error"] = torch.zeros(self.num_envs, 1, device=self.cfg.device)
 
         return TensorDict({
             "agents": TensorDict(
