@@ -19,7 +19,7 @@ log_interval: 10    # log to wandb every N steps (reduces serialisation overhead
 # Training Environment
 env:
   num_envs: 2 # Number of drones for training
-  max_episode_length: 2200
+  max_episode_length: 1000  # 2200→1000: 目标~30m, 2m/s需約4×150=600步; 短化提高episode多样性
   env_spacing: 8.0 
   num_obstacles: 350
 
@@ -44,3 +44,8 @@ wandb:
   entity: 1281450785-szu
   mode: online # offline
   run_id: #kw9xf9k9
+
+# Visualization (V1 topo graph, V2 attention heatmaps, V3 reward bars)
+# Only active for graph_ppo mode; uses matplotlib + PIL, no GPU needed.
+viz:
+  interval: 50   # log viz images to WandB every N training steps

@@ -132,20 +132,20 @@ class NavigationEnv(IsaacEnv):
         # drone_prim = self.drone.spawn(translations=[(0.0, 0.0, 1.0)])[0]
         drone_prim = self.drone.spawn(translations=[(0.0, 0.0, 2.0)])[0]
 
-        # lighting
+        # Lighting — warm directional sun + cool ambient dome
         light = AssetBaseCfg(
             prim_path="/World/light",
-            spawn=sim_utils.DistantLightCfg(color=(0.75, 0.75, 0.75), intensity=3000.0),
+            spawn=sim_utils.DistantLightCfg(color=(1.0, 0.95, 0.85), intensity=4000.0),
         )
         sky_light = AssetBaseCfg(
             prim_path="/World/skyLight",
-            spawn=sim_utils.DomeLightCfg(color=(0.2, 0.2, 0.3), intensity=2000.0),
+            spawn=sim_utils.DomeLightCfg(color=(0.4, 0.5, 0.7), intensity=1200.0),
         )
         light.spawn.func(light.prim_path, light.spawn, light.init_state.pos)
         sky_light.spawn.func(sky_light.prim_path, sky_light.spawn)
-        
-        # Ground Plane
-        cfg_ground = sim_utils.GroundPlaneCfg(color=(0.1, 0.1, 0.1), size=(300., 300.))
+
+        # Ground Plane — dark charcoal for contrast
+        cfg_ground = sim_utils.GroundPlaneCfg(color=(0.05, 0.05, 0.07), size=(300., 300.))
         cfg_ground.func("/World/defaultGroundPlane", cfg_ground, translation=(0, 0, 0.01))
 
         self.map_range = [20.0, 20.0, 4.5]
@@ -268,7 +268,8 @@ class NavigationEnv(IsaacEnv):
                         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
                         mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
                         collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
+                        # Orange-brown for 3D dynamic obstacles (warm, easy to spot)
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.85, 0.40, 0.10), metallic=0.3),
                     ),
                     init_state=RigidObjectCfg.InitialStateCfg(),
                 )
@@ -282,11 +283,12 @@ class NavigationEnv(IsaacEnv):
                     prim_path=f"/World/Origin{construct_input(category_idx*self.dyn_obs_num_of_each_category, (category_idx+1)*self.dyn_obs_num_of_each_category)}/Cylinder",
                     spawn=sim_utils.CylinderCfg(
                         radius = radius,
-                        height = self.max_obs_2d_height, 
+                        height = self.max_obs_2d_height,
                         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
                         mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
                         collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
+                        # Slate-blue for 2D dynamic obstacles (contrasts with 3D)
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.25, 0.45, 0.75), metallic=0.3),
                     ),
                     init_state=RigidObjectCfg.InitialStateCfg(),
                 )
@@ -751,21 +753,31 @@ class NavigationEnv(IsaacEnv):
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
         collision = static_collision | dynamic_collision
 
-        # h. goal reached bonus
-        reach_goal_bonus = (distance_for_reward < 0.5).float() * 50.0  # terminal bonus
+        # h. goal reached bonus (one-time: episode will terminate this step)
+        reach_goal = (distance_for_reward < 0.5)  # (B, 1) bool
+        reach_goal_bonus = reach_goal.float() * 50.0
+
+        # i. Continuous approach shaping: 2/(d+0.5) — smoothly increases as drone nears goal.
+        #    Unlike a step-function (was: (d<2m)*1), this gives non-zero gradient at ALL
+        #    distances and prevents the "outside-2m plateau" where the policy stalls.
+        #    At d=0 (goal): 4.0; at d=1.5m: ~1.14; at d=5m: ~0.36; at d=20m: ~0.10.
+        #    Weight=2.0 chosen so at d=0 the bonus is 8.0 — just below reach_goal_bonus/6
+        #    and large enough to dominate random movement (reward_vel mean ≈ 2–3 in early training).
+        approach_bonus = 2.0 / (distance_for_reward + 0.5)  # (B, 1), always positive
 
         # Final reward calculation
         # Weight rationale:
         #   reward_vel      ×5.0   — primary signal: speed toward goal (qp_v_max=2 → max ≈10)
         #   reward_progress ×20.0  — dense shaping: actual step displacement (0.04m/step ≈ 0.8)
-        #   reach_goal_bonus 50.0  — strong terminal incentive to complete the task
+        #   reach_goal_bonus 50.0  — terminal bonus, fires once when episode ends at goal
+        #   approach_bonus  2/(d+0.5) — continuous inverse-dist shaping (max 4 at goal)
         #   1.0 base           — keeps value baseline positive for ValueNorm stability
-        #   penalty_collision  — activated on collision (no longer commented out)
-        #   penalty_smooth/height remain for flight quality
+        #   collision         -10  — discourage collisions; QP prevents most but not all
         #   safety rewards     — ZERO weight (QP layer handles physical safety)
         self.reward = (reward_vel * 5.0
                        + reward_progress * 20.0
                        + reach_goal_bonus
+                       + approach_bonus
                        + 1.
                        - collision.float() * 10.0
                        - penalty_smooth * 0.1
@@ -782,10 +794,11 @@ class NavigationEnv(IsaacEnv):
                 + track_w * self._last_tracking_error.unsqueeze(-1)
 
         # Terminate Conditions
-        reach_goal = (distance_for_reward < 0.5)  # (B, 1) bool
+        # reach_goal → terminated so: (a) episode resets giving diverse new start points,
+        #   (b) reach_goal_bonus is truly one-time, (c) value estimates stay bounded.
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > 4.
-        self.terminated = below_bound | above_bound | collision
+        self.terminated = below_bound | above_bound | collision | reach_goal
         self.truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1) # progress buf is to track the step number
 
         # update previous velocity for smoothness calculation in the next ieteration

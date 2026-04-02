@@ -126,27 +126,44 @@ class GAE(nn.Module):
         self.register_buffer("lmbda", torch.tensor(lmbda))
         self.gamma: torch.Tensor
         self.lmbda: torch.Tensor
-    
+
     def forward(
-        self, 
-        reward: torch.Tensor, 
-        terminated: torch.Tensor, 
-        value: torch.Tensor, 
+        self,
+        reward: torch.Tensor,
+        terminated: torch.Tensor,
+        value: torch.Tensor,
         next_value: torch.Tensor
     ):
-        num_steps = terminated.shape[1]
-        advantages = torch.zeros_like(reward)
-        not_done = 1 - terminated.float()
-        gae = 0
-        for step in reversed(range(num_steps)):
-            delta = (
-                reward[:, step] 
-                + self.gamma * next_value[:, step] * not_done[:, step] 
-                - value[:, step]
-            )
-            advantages[:, step] = gae = delta + (self.gamma * self.lmbda * not_done[:, step] * gae) 
-        returns = advantages + value
-        return advantages, returns
+        # Vectorized GAE (reversed scan, O(T) Python iterations each doing full-batch tensor ops).
+        # Standard PPO GAE:  A_t = δ_t + (γλ·mask_t)·A_{t+1}
+        # Each iteration is a vectorized op over B — no per-sample Python overhead.
+        not_done = 1.0 - terminated.float()           # (B, T, 1)
+        gl       = self.gamma * self.lmbda            # scalar
+        delta    = reward + self.gamma * next_value * not_done - value  # (B, T, 1)
+
+        # Compute discount factors per step: (γλ·mask) shifted right by one
+        # weights[t] = γλ · mask_t  (the multiplier applied when propagating from t+1 → t)
+        weights = gl * not_done                        # (B, T, 1)
+
+        # Reverse cumsum via flip → cumsum → flip:
+        # A_T = δ_T
+        # A_{T-1} = δ_{T-1} + w_{T-1} * A_T
+        # ...
+        # We implement this as a scan using torch ops (no Python loop):
+        T = delta.shape[1]
+        # Stack: for each t, we need product of weights[t], weights[t+1], ..., weights[T-2]
+        # Equivalent to exclusive suffix product.
+        # Compute via log-space prefix sum on reversed sequence, then reverse back.
+        # To avoid log(0) for done steps, work directly with a manual reversed cumsum.
+        # This is O(T) tensor ops, vectorized across B.
+        adv = torch.zeros_like(delta)
+        gae = torch.zeros_like(delta[:, 0])   # (B, 1)
+        for t in reversed(range(T)):
+            gae = delta[:, t] + weights[:, t] * gae
+            adv[:, t] = gae
+
+        returns = adv + value
+        return adv, returns
 
 def make_batch(tensordict: TensorDict, num_minibatches: int):
     tensordict = tensordict.reshape(-1) 

@@ -61,7 +61,8 @@ class PPO(TensorDictModuleBase):
         ).to(self.device)
 
         self.value_norm     = ValueNorm(1).to(self.device)
-        self.gae            = GAE(0.99, 0.95)
+        _gamma = float(getattr(self.cfg, 'gamma', 0.995))
+        self.gae            = GAE(_gamma, 0.95)
         self.critic_loss_fn = nn.HuberLoss(delta=10)
 
         self.graph_optim = torch.optim.Adam(
@@ -112,7 +113,8 @@ class PPO(TensorDictModuleBase):
         self.value_norm = ValueNorm(1).to(self.device)
 
         # Loss related
-        self.gae = GAE(0.99, 0.95)
+        _gamma = float(getattr(cfg, 'gamma', 0.995))
+        self.gae = GAE(_gamma, 0.95)
         self.critic_loss_fn = nn.HuberLoss(delta=10)
 
         # Optimizer
@@ -164,8 +166,15 @@ class PPO(TensorDictModuleBase):
         edge_mask      = tensordict["agents", "observation", "edge_mask"].bool()  # (B, N+1, N+1)
         drone_state    = tensordict["agents", "observation", "state"]           # (B, 8)
 
-        # Graph transformer → probs (B, N), h (B, N+1, hidden_dim)
-        probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask)
+        # Precompute SPD matrix here (rollout time) and cache in tensordict so
+        # _update_graph can reuse it during training \u2014 avoids rerunning Floyd-Warshall
+        # (O(N\u00b3)=51\u00b3\u22481.3\u00d710\u2075 ops) for each minibatch over 2 epochs=32 times.
+        spd_matrix = GraphTransformer._compute_spd_matrix(edge_mask)  # (B, N+1, N+1)
+        tensordict["_spd_matrix"] = spd_matrix
+
+        # Graph transformer \u2192 probs (B, N), h (B, N+1, hidden_dim)
+        probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask,
+                                          spd_matrix=spd_matrix)
 
         # Sample action from Categorical distribution
         dist       = Categorical(probs=probs)
@@ -228,9 +237,15 @@ class PPO(TensorDictModuleBase):
             with torch.no_grad():
                 for start in range(0, total, chunk_size):
                     end = min(start + chunk_size, total)
+                    # Reuse cached SPD matrix if present — avoids redundant Floyd-Warshall.
+                    # The flat slice preserves the same index range as the observation slices.
+                    spd_chunk = None
+                    if "_spd_matrix" in flat_td.keys():
+                        spd_chunk = flat_td["_spd_matrix"][start:end]
                     _, h = self.graph_transformer(
                         node_features[start:end], edge_features[start:end],
                         node_mask[start:end],     edge_mask[start:end],
+                        spd_matrix=spd_chunk,
                     )
                     h_ego = h[:, 0, :]              # (chunk, hidden_dim)
                     v = self.graph_critic_mlp(torch.cat([h_ego, drone_state[start:end]], dim=-1))
@@ -297,7 +312,11 @@ class PPO(TensorDictModuleBase):
         edge_mask     = tensordict["agents", "observation", "edge_mask"].bool()
         drone_state   = tensordict["agents", "observation", "state"]
 
-        probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask)
+        # Reuse SPD matrix cached during rollout — avoids Floyd-Warshall on every minibatch
+        spd_matrix = tensordict.get("_spd_matrix", None)
+
+        probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask,
+                                          spd_matrix=spd_matrix)
         dist           = Categorical(probs=probs)
         log_probs      = dist.log_prob(tensordict["graph_action"])   # (B,)
         action_entropy = dist.entropy()                             # (B,)
@@ -340,6 +359,48 @@ class PPO(TensorDictModuleBase):
             "critic_grad_norm": grad_norm,
             "explained_var":   explained_var,
         }, [])
+
+    @torch.no_grad()
+    def get_viz_data(self, tensordict):
+        """Return intermediate quantities needed for visualization (V1, V2, V3).
+        Operates on a single-frame tensordict, e.g. data[:, -1].
+        Returns a plain dict of CPU tensors — safe to pass directly to viz.py functions.
+        """
+        if not self.graph_ppo:
+            return {}
+
+        node_features  = tensordict["agents", "observation", "node_features"][:1]  # env 0 only
+        node_positions = tensordict["agents", "observation", "node_positions"][:1]
+        edge_features  = tensordict["agents", "observation", "edge_features"][:1]
+        node_mask      = tensordict["agents", "observation", "node_mask"][:1].bool()
+        edge_mask      = tensordict["agents", "observation", "edge_mask"][:1].bool()
+        drone_state    = tensordict["agents", "observation", "state"][:1]
+
+        probs, h, all_attn = self.graph_transformer.forward_with_attn(
+            node_features, edge_features, node_mask, edge_mask
+        )
+
+        h_ego  = h[:, 0, :]
+        value  = self.graph_critic_mlp(torch.cat([h_ego, drone_state], dim=-1))
+
+        action_idx = tensordict.get("graph_action", None)
+        selected   = action_idx[:1].cpu() if action_idx is not None else None
+
+        # Safe optional fetch — avoids Python 'and' on a Tensor (ambiguous boolean)
+        v_rl_key  = "_v_rl"
+        v_rl_val  = tensordict[v_rl_key][:1].cpu() if v_rl_key in tensordict.keys() else None
+
+        return {
+            "node_positions": node_positions[0].cpu(),   # (N+1, 3)
+            "node_mask":      node_mask[0].cpu(),        # (N+1,)  bool
+            "edge_mask":      edge_mask[0].cpu(),        # (N+1, N+1) bool
+            "probs":          probs[0].cpu(),            # (N,)
+            "node_features":  node_features[0].cpu(),   # (N+1, node_feat_dim)
+            "all_attn":       all_attn,                  # list[L] of (1, H, N+1, N+1) CPU
+            "value":          value[0].cpu(),            # (1,)
+            "selected_idx":   selected,                  # (1,) or None
+            "v_rl":           v_rl_val,
+        }
 
     def _update_cnn(self, tensordict):
         """Original CNN PPO minibatch update (unchanged)."""

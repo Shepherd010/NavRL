@@ -1,18 +1,19 @@
 algo:
   feature_extractor:
-    learning_rate: 5e-4
+    learning_rate: 3e-4   # 5e-4→3e-4: reward scale 提升后梯度更大，降 lr 更稳定
     dyn_obs_num: 5
   
   actor:
-    learning_rate: 5e-4
-    clip_ratio: 0.1
+    learning_rate: 3e-4
+    clip_ratio: 0.15      # 0.1→0.15: 早期策略变化需要更大步长
     action_limit: 2.0 # m/s
   
   critic:
-    learning_rate: 5e-4
-    clip_ratio: 0.1
+    learning_rate: 3e-4
+    clip_ratio: 0.15
   
-  entropy_loss_coefficient: 1e-3 # encourage exploration
+  entropy_loss_coefficient: 1e-3
   training_frame_num: 32
-  training_epoch_num: 2  # 4→2: halves gradient-update time; 32768 diverse samples still sufficient
-  num_minibatches: 8     # 16→8: doubles minibatch size (4096) for better GPU utilisation
+  training_epoch_num: 4
+  num_minibatches: 16    # keep at 16: minibatch=2048; halving to 8 doubles edge tensor memory (51×51×heads) → OOM
+  gamma: 0.995           # 0.99→0.995: 目标距离20-40m，需要更长 horizon 才能学到跨远粿划

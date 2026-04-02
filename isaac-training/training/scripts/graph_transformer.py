@@ -128,7 +128,7 @@ class GraphTransformerLayer(nn.Module):
         # -- Residual + LayerNorm --
         h = self.norm1(h + out)
         h = self.norm2(h + self.drop2(self.ffn(h)))
-        return h
+        return h, attn  # attn: (B, H, N, N) — returned for viz; ignored in normal training
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +199,11 @@ class GraphTransformer(nn.Module):
 
     def forward(
         self,
-        node_features: torch.Tensor,   # (B, N+1, 18)
-        edge_features: torch.Tensor,   # (B, N+1, N+1, 7)
-        node_mask:     torch.Tensor,   # (B, N+1) bool
-        edge_mask:     torch.Tensor,   # (B, N+1, N+1) bool
+        node_features: torch.Tensor,        # (B, N+1, 18)
+        edge_features: torch.Tensor,        # (B, N+1, N+1, 7)
+        node_mask:     torch.Tensor,        # (B, N+1) bool
+        edge_mask:     torch.Tensor,        # (B, N+1, N+1) bool
+        spd_matrix:    torch.Tensor = None, # (B, N+1, N+1) precomputed — pass to skip recomputation
     ):
         B, Np1, _ = node_features.shape
 
@@ -211,32 +212,60 @@ class GraphTransformer(nn.Module):
         e = self.edge_proj(edge_features)  # (B, N+1, N+1, D)
 
         # Precompute SPD matrix once (shared across all layers)
-        spd_matrix = self._compute_spd_matrix(edge_mask) if self.use_spd_bias else None
+        # Caller may pass a precomputed matrix (e.g. cached from rollout) to skip Floyd-Warshall.
+        if spd_matrix is None:
+            spd_matrix = self._compute_spd_matrix(edge_mask) if self.use_spd_bias else None
 
-        # Transformer layers
+        # Transformer layers — each returns (h, attn); we discard attn in normal training
         for layer in self.layers:
-            h = layer(h, e, node_mask, edge_mask, spd_matrix)
+            h, _ = layer(h, e, node_mask, edge_mask, spd_matrix)
 
-        # -- Node selection head --
-        h_ego  = h[:, 0:1, :]                                    # (B, 1, D)
-        h_cand = h[:, 1:, :]                                      # (B, N, D)
-        h_ego_exp = h_ego.expand(-1, Np1 - 1, -1)                # (B, N, D)
-        h_concat  = torch.cat([h_ego_exp, h_cand], dim=-1)        # (B, N, 2D)
-        logits    = self.score_mlp(h_concat).squeeze(-1)          # (B, N)
+        probs, cand_mask = self._score_nodes(h, node_mask, Np1)
+        return probs, h
 
-        # Mask invalid candidate nodes
-        cand_mask = node_mask[:, 1:]   # (B, N)
-        no_cand = cand_mask.sum(dim=-1) == 0
+    def forward_with_attn(
+        self,
+        node_features: torch.Tensor,
+        edge_features: torch.Tensor,
+        node_mask:     torch.Tensor,
+        edge_mask:     torch.Tensor,
+        spd_matrix:    torch.Tensor = None,
+    ):
+        """Same as forward() but also returns attn weights from all layers.
+        Used exclusively for visualization — not called during training.
+        Returns: probs (B,N), h (B,N+1,D), all_attn list[L × (B,H,N,N)]
+        """
+        B, Np1, _ = node_features.shape
+        h = self.node_proj(node_features)
+        e = self.edge_proj(edge_features)
+        if spd_matrix is None:
+            spd_matrix = self._compute_spd_matrix(edge_mask) if self.use_spd_bias else None
+
+        all_attn = []
+        for layer in self.layers:
+            h, attn = layer(h, e, node_mask, edge_mask, spd_matrix)
+            all_attn.append(attn.cpu())  # keep on CPU immediately to save VRAM
+
+        probs, _ = self._score_nodes(h, node_mask, Np1)
+        return probs, h, all_attn
+
+    def _score_nodes(self, h, node_mask, Np1):
+        """Shared scoring head used by both forward() and forward_with_attn()."""
+        h_ego  = h[:, 0:1, :]
+        h_cand = h[:, 1:, :]
+        h_ego_exp = h_ego.expand(-1, Np1 - 1, -1)
+        h_concat  = torch.cat([h_ego_exp, h_cand], dim=-1)
+        logits    = self.score_mlp(h_concat).squeeze(-1)
+
+        cand_mask = node_mask[:, 1:]
+        no_cand   = cand_mask.sum(dim=-1) == 0
         if torch.any(no_cand):
-            # Fallback must only patch rows with zero valid candidates.
-            # Using cand_mask[:, 0] = True would wrongly bias all envs in the batch.
             cand_mask = cand_mask.clone()
             cand_mask[no_cand, 0] = True
 
         logits = logits.masked_fill(~cand_mask, -1e9)
-        probs  = F.softmax(logits, dim=-1)  # (B, N)
-
-        return probs, h
+        probs  = F.softmax(logits, dim=-1)
+        return probs, cand_mask
 
     # ------------------------------------------------------------------
 

@@ -13,6 +13,7 @@ from omni_drones.utils.torchrl import SyncDataCollector, EpisodeStats
 from torchrl.envs.transforms import TransformedEnv, Compose
 from utils import evaluate
 from torchrl.envs.utils import ExplorationType
+import viz as viz_lib  # visualization helpers (V1-V4)
 
 
 
@@ -85,6 +86,11 @@ def main(cfg):
 
     # Training Loop
     log_interval = int(OmegaConf.select(cfg, 'log_interval', default=10))  # log every N steps
+    viz_interval = int(OmegaConf.select(cfg, 'viz.interval', default=50))  # viz every N steps
+    _traj_segs: list = []   # rolling buffer of (T,3) trajectory segments for V4
+    # Rolling history buffers for learning curves (Panel C in nav_dashboard)
+    _value_history:    list = []   # mean V(s) per viz step
+    _distance_history: list = []   # mean dist-to-goal per viz step
     for i, data in enumerate(collector):
         # Log Info
         info = {"env_frames": collector._frames, "rollout_fps": collector._fps}
@@ -136,6 +142,87 @@ def main(cfg):
         # Update wandb — throttled to every log_interval steps to reduce serialisation overhead
         if i % log_interval == 0:
             run.log(info, step=i)
+
+        # -----------------------------------------------------------------
+        # Visualization block (V1 topo graph, V2 attention, V3 reward bars)
+        # Runs every viz_interval steps; uses env 0 from the last rollout frame
+        # -----------------------------------------------------------------
+        if policy.graph_ppo and i > 0 and i % viz_interval == 0:
+            try:
+                viz_td   = data[:, -1]   # last frame of rollout, all envs
+                viz_data = policy.get_viz_data(viz_td)
+
+                # ── Build reward-bar dict (V3 / Panel B of nav_dashboard) ─────────
+                rbar = None
+                if ("next", "stats") in data.keys(True, True):
+                    raw = data["next", "stats"]
+                    _reward_key_map = {
+                        "reward_vel":       ("vel",          +1.0),
+                        "reward_progress":  ("progress",     +1.0),
+                        "penalty_smooth":   ("smooth (−)",   -1.0),
+                        "penalty_height":   ("height (−)",   -1.0),
+                        "collision":        ("collision (−)", -10.0),
+                        "qp_intervention":  ("QP interv.",   -1.0),
+                    }
+                    _tmp = {}
+                    for rk, (display, sign) in _reward_key_map.items():
+                        if rk in raw.keys():
+                            _tmp[display] = sign * float(raw[rk][:, -1].float().mean().item())
+                    if _tmp:
+                        rbar = _tmp
+
+                # ── Accumulate value & distance history (Panel C of nav_dashboard) ─
+                _val_scalar  = float(viz_data["value"].mean().item()) \
+                               if viz_data.get("value") is not None else None
+                _dist_scalar = None
+                if ("next", "stats") in data.keys(True, True):
+                    raw = data["next", "stats"]
+                    if "distance_to_goal" in raw.keys():
+                        _dist_scalar = float(raw["distance_to_goal"][:, -1].float().mean().item())
+                if _val_scalar is not None:
+                    _value_history.append(_val_scalar)
+                if _dist_scalar is not None:
+                    _distance_history.append(_dist_scalar)
+                # Keep last 100 data points to avoid ever-growing history
+                if len(_value_history)    > 100: _value_history    = _value_history[-100:]
+                if len(_distance_history) > 100: _distance_history = _distance_history[-100:]
+
+                # ── V4 trajectory segments ───────────────────────────────────────
+                np_key = ("agents", "observation", "node_positions")
+                if np_key in data.keys(True, True):
+                    ego_pos = data[np_key][0, :, 0, :].cpu()  # (T, 3)
+                    _traj_segs.append(ego_pos)
+                    if len(_traj_segs) > 16:
+                        _traj_segs = _traj_segs[-16:]
+
+                # ── Composite figure 1: Navigation Dashboard (V1 + V3 + curves) ──
+                nav_fig = viz_lib.plot_nav_dashboard(
+                    node_positions=viz_data["node_positions"],
+                    node_mask=viz_data["node_mask"],
+                    probs=viz_data["probs"],
+                    selected_idx=viz_data["selected_idx"],
+                    edge_mask=viz_data["edge_mask"],
+                    reward_components=rbar,
+                    value_history=_value_history    if len(_value_history)    > 1 else None,
+                    distance_history=_distance_history if len(_distance_history) > 1 else None,
+                    step=i,
+                )
+
+                # ── Composite figure 2: Training Internals (V2 + V4) ────────────
+                train_fig = viz_lib.plot_training_status(
+                    all_attn=viz_data["all_attn"],
+                    node_mask=viz_data["node_mask"],
+                    trajectories=_traj_segs if _traj_segs else None,
+                    step=i,
+                )
+
+                run.log({
+                    "viz/nav_dashboard":    wandb.Image(nav_fig),
+                    "viz/training_status":  wandb.Image(train_fig),
+                }, step=i)
+            except Exception as _viz_err:
+                # Never let viz crash training
+                print(f"[NavRL viz] warning: {_viz_err}")
 
         # Save Model
         if i % cfg.save_interval == 0:
