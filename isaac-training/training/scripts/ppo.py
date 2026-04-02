@@ -50,6 +50,9 @@ class PPO(TensorDictModuleBase):
             num_heads=int(topo_cfg.num_heads),
             num_layers=int(topo_cfg.num_layers),
             dropout=float(topo_cfg.dropout),
+            use_spd_bias=bool(getattr(topo_cfg, 'use_spd_bias', False)),
+            use_topo_bias=bool(getattr(topo_cfg, 'use_topo_bias', False)),
+            sparse_topk=int(getattr(topo_cfg, 'sparse_topk', 8)),
         ).to(self.device)
 
         # Critic: ego-node embedding (hidden_dim) + drone_state (8) → value
@@ -166,14 +169,11 @@ class PPO(TensorDictModuleBase):
         edge_mask      = tensordict["agents", "observation", "edge_mask"].bool()  # (B, N+1, N+1)
         drone_state    = tensordict["agents", "observation", "state"]           # (B, 8)
 
-        # Precompute SPD matrix here (rollout time) and cache in tensordict so
-        # _update_graph can reuse it during training — avoids rerunning Floyd-Warshall
-        # (O(N³)=51³≈1.3×10⁵ ops) for each minibatch over 2 epochs=32 times.
-        # Use instance call (static method accessible via self) to avoid NameError:
-        # GraphTransformer is imported locally inside _build_graph_ppo and is not
-        # available in this method's scope.
-        spd_matrix = self.graph_transformer._compute_spd_matrix(edge_mask)  # (B, N+1, N+1)
-        tensordict["_spd_matrix"] = spd_matrix
+        # Precompute SPD matrix only when model actually uses SPD bias.
+        spd_matrix = None
+        if self.graph_transformer.need_spd_matrix():
+            spd_matrix = self.graph_transformer._compute_spd_matrix(edge_mask)  # (B, N+1, N+1)
+            tensordict["_spd_matrix"] = spd_matrix
 
         # Graph transformer \u2192 probs (B, N), h (B, N+1, hidden_dim)
         probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask,

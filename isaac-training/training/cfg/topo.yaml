@@ -4,7 +4,7 @@
 
 topo:
   # ----- TopoExtractor -----
-  max_nodes: 50                  # max Voronoi nodes (excluding ego), total N+1 = 51
+  max_nodes: 24                  # reduced for lower O(N^2) attention cost, total N+1 = 25
   node_feat_dim: 18
   edge_feat_dim: 8                # 3(rel_pos)+1(elen)+1(dyn_dist)+3(dir)
   lidar_range: 10.0              # must match sensor.lidar_range in train.yaml
@@ -17,21 +17,24 @@ topo:
   use_topo: true                 # enable graph observation keys in env
 
   # ----- GraphTransformer -----
-  hidden_dim: 64
+  hidden_dim: 48
   num_heads: 4                   # must divide hidden_dim evenly
-  num_layers: 3
+  num_layers: 2
   dropout: 0.1
-  use_spd_bias: true             # use shortest path distance bias in attention
+  # Complexity reduction switches
+  use_topo_bias: false           # disable edge/spd bias MLPs (largest NxN cost outside QK)
+  use_spd_bias: false            # disable Floyd-Warshall + SPD bias
+  sparse_topk: 8                # sparse attention per query node: O(N*K), K<<N
   value_chunk_size: 1024         # shift-trick reduces next_values to 1 forward pass (1024 samples) — fits in one chunk
 
   # ----- node_to_velocity -----
-  v_target: 2.0                  # cruise speed (m/s)
+  v_target: 5.0                  # cruise speed (m/s)
   min_dist: 0.1                  # minimum distance to avoid div-by-zero
 
   # ----- SafetyShieldQP -----
   qp_relaxation_weight: 5000.0   # lambda: penalty on slack variables
   qp_max_relaxation: 0.3         # delta_max: max constraint violation allowed (m/s)
-  qp_v_max: 2.0                  # velocity bound (m/s), should match v_target
+  qp_v_max: 5.0                  # velocity bound (m/s), should match v_target
   qp_safe_distance: 0.15         # CBF safe margin (m); minimal — QP is last-resort safety, not primary signal
   qp_cbf_alpha: 0.8              # CBF gain (lower = softer intervention)
 

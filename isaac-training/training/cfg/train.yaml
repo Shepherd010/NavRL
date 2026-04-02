@@ -12,9 +12,9 @@ seed: 0
 
 # Total Training Length
 max_frame_num: 12e8 # max frame 
-eval_interval: 1000 # evaluate the policy for every N training steps
-save_interval: 1000
-log_interval: 10    # log to wandb every N steps (reduces serialisation overhead)
+eval_interval: 200 # evaluate the policy for every N training steps
+save_interval: 200
+log_interval: 1    # log to wandb every N steps (reduces serialisation overhead)
 
 # Training Environment
 env:

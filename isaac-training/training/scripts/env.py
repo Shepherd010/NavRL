@@ -743,7 +743,7 @@ class NavigationEnv(IsaacEnv):
         valid_progress = (self.prev_target_distance < 1e6)                                  # (B, 1) bool
         delta_d = (self.prev_target_distance - distance_for_reward) * valid_progress.float()  # (B, 1) meters
         self.prev_target_distance = distance_for_reward.clone()
-        reward_progress = delta_d * 200.0   # ±8 / step at v_max; negative when retreating
+        reward_progress = delta_d * 300.0   # ±8 / step at v_max; negative when retreating
 
         # c. Velocity projected onto goal direction — continuous directional signal.
         #    Positive when flying toward goal, negative when flying away.

@@ -6,7 +6,7 @@ algo:
   actor:
     learning_rate: 3e-4
     clip_ratio: 0.15      # 0.1→0.15: 早期策略变化需要更大步长
-    action_limit: 2.0 # m/s
+    action_limit: 5.0 # m/s
   
   critic:
     learning_rate: 3e-4
