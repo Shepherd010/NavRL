@@ -167,9 +167,12 @@ class PPO(TensorDictModuleBase):
         drone_state    = tensordict["agents", "observation", "state"]           # (B, 8)
 
         # Precompute SPD matrix here (rollout time) and cache in tensordict so
-        # _update_graph can reuse it during training \u2014 avoids rerunning Floyd-Warshall
-        # (O(N\u00b3)=51\u00b3\u22481.3\u00d710\u2075 ops) for each minibatch over 2 epochs=32 times.
-        spd_matrix = GraphTransformer._compute_spd_matrix(edge_mask)  # (B, N+1, N+1)
+        # _update_graph can reuse it during training — avoids rerunning Floyd-Warshall
+        # (O(N³)=51³≈1.3×10⁵ ops) for each minibatch over 2 epochs=32 times.
+        # Use instance call (static method accessible via self) to avoid NameError:
+        # GraphTransformer is imported locally inside _build_graph_ppo and is not
+        # available in this method's scope.
+        spd_matrix = self.graph_transformer._compute_spd_matrix(edge_mask)  # (B, N+1, N+1)
         tensordict["_spd_matrix"] = spd_matrix
 
         # Graph transformer \u2192 probs (B, N), h (B, N+1, hidden_dim)
