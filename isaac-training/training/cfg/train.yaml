@@ -39,9 +39,9 @@ viewer:
   resolution: [960, 720]
 
 wandb:
-  project: "222"
+  project: "isaac-training"
   name: navigation_training
-  entity: 1281450785-szu
+  entity: shepherd010
   mode: online # offline
   run_id: #kw9xf9k9
 
