@@ -712,69 +712,77 @@ class NavigationEnv(IsaacEnv):
 
 
         # -----------------Reward Calculation-----------------
-        # a. safety reward for static obstacles
-        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
-        
+        # NOTE: In graph_ppo mode, physical safety is enforced by SafetyShieldQP at the
+        # control level (hard CBF constraint). The RL reward therefore does NOT need a
+        # safety bonus — adding one causes hovering because log(lidar_range - scan) is
+        # positive when surrounded by obstacles and very negative in open space, so the
+        # agent learns to stay still inside obstacle clusters to maximise safety reward.
+        # Instead: only penalise actual collisions, and strongly reward goal progress.
 
-        # b. safety reward for dynamic obstacles
+        # a. safety reward kept only for logging (weight = 0)
+        reward_safety_static = torch.log((self.lidar_range-self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+
+        # b. safety reward for dynamic obstacles (logging only)
         if (self.cfg.env_dyn.num_obstacles != 0):
             reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
         else:
             reward_safety_dynamic = torch.zeros(self.num_envs, 1, device=self.cfg.device)
 
-        # c. velocity reward for goal direction
+        # c. velocity reward — speed projected onto goal direction (primary signal)
         vel_direction = rpos / distance.clamp_min(1e-6)
         reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)  # (B, 1)
 
-        # c2. progress reward: positive when drone moves closer to goal this step
-        #     clamped to 0 so no penalty for moving away (reward_vel already handles that)
-        #     inf on first step after reset → clamp produces 0 (safe)
+        # d. progress reward — actual distance reduction this step (dense shaping)
+        #    clamped to 0: no penalty for moving away, reward_vel handles that
+        #    inf on first step after reset → clamp gives 0 (safe)
         distance_for_reward = distance.squeeze(1)  # (B, 1)
         reward_progress = (self.prev_target_distance - distance_for_reward).clamp(min=0.)  # (B, 1)
         self.prev_target_distance = distance_for_reward.clone()
 
-        # d. smoothness reward for action smoothness
+        # e. smoothness penalty
         penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)
         
-        # e. height penalty reward for flying unnessarily high or low
+        # f. height penalty
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = ( (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2)**2 )[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)]
         penalty_height[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)] = ( (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2])**2 )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
 
-
-        # f. Collision condition with its penalty
+        # g. collision detection
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") >  (self.lidar_range - 0.3) # 0.3 collision radius
         collision = static_collision | dynamic_collision
-        
+
+        # h. goal reached bonus
+        reach_goal_bonus = (distance_for_reward < 0.5).float() * 50.0  # terminal bonus
+
         # Final reward calculation
         # Weight rationale:
-        #   reward_vel      ×2.0  — primary signal: speed toward goal (max ~2.0*2=4.0)
-        #   reward_progress ×5.0  — dense shaping: actual displacement toward goal (max ~0.03m per step ≈0.15)
-        #   reward_safety   ×0.3  — safety bonus (log(10)≈2.3 → 0.7), no longer dominates
-        #   1.0 base keeps returns positive so value-norm is stable
-        if (self.cfg.env_dyn.num_obstacles != 0):
-            self.reward = reward_vel * 2.0 + reward_progress * 5.0 + 1. + reward_safety_static * 0.3 + reward_safety_dynamic * 0.3 - penalty_smooth * 0.1 - penalty_height * 8.0
-        else:
-            self.reward = reward_vel * 2.0 + reward_progress * 5.0 + 1. + reward_safety_static * 0.3 - penalty_smooth * 0.1 - penalty_height * 8.0
+        #   reward_vel      ×5.0   — primary signal: speed toward goal (qp_v_max=2 → max ≈10)
+        #   reward_progress ×20.0  — dense shaping: actual step displacement (0.04m/step ≈ 0.8)
+        #   reach_goal_bonus 50.0  — strong terminal incentive to complete the task
+        #   1.0 base           — keeps value baseline positive for ValueNorm stability
+        #   penalty_collision  — activated on collision (no longer commented out)
+        #   penalty_smooth/height remain for flight quality
+        #   safety rewards     — ZERO weight (QP layer handles physical safety)
+        self.reward = (reward_vel * 5.0
+                       + reward_progress * 20.0
+                       + reach_goal_bonus
+                       + 1.
+                       - collision.float() * 10.0
+                       - penalty_smooth * 0.1
+                       - penalty_height * 8.0)
 
         # Graph-PPO reward shaping: QP intervention penalty + tracking error penalty
         # Cached by _pre_sim_step_graph; absent when use_topo=False.
-        # doc/06 §阶段3 reward: r_intv = 0.2*(exp(-I²/(2×0.5²))-1), r_freq = -0.5*𝟙[I>1.0]
         if self.use_topo and hasattr(self, '_last_intervention') and self._last_intervention is not None:
             I_t     = self._last_intervention                              # (B,)
-            r_intv  = 0.2 * (torch.exp(-I_t ** 2 / (2 * 0.25)) - 1.0)    # 0.25 = 2*0.5²
-            r_freq  = -0.5 * (I_t > 1.0).float()
-            track_w = float(self.cfg.topo.reward_tracking_weight)          # e.g. -0.1
+            r_intv  = 0.1 * (torch.exp(-I_t ** 2 / (2 * 0.25)) - 1.0)    # small nudge to limit over-intervention
+            track_w = float(self.cfg.topo.reward_tracking_weight)
             self.reward = self.reward \
                 + r_intv.unsqueeze(-1) \
-                + r_freq.unsqueeze(-1) \
                 + track_w * self._last_tracking_error.unsqueeze(-1)
 
-        # Terminal reward
-        # self.reward[collision] -= 50. # collision
-
         # Terminate Conditions
-        reach_goal = (distance.squeeze(-1) < 0.5)
+        reach_goal = (distance_for_reward < 0.5)  # (B, 1) bool
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > 4.
         self.terminated = below_bound | above_bound | collision

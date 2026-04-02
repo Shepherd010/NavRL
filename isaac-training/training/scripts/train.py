@@ -95,6 +95,16 @@ def main(cfg):
         torch.cuda.empty_cache()   # release fragmented CUDA allocator blocks after training step
         info.update(train_loss_stats) # log training loss info
 
+        # Log real-time training status from the latest frame in this batch.
+        # This complements EpisodeStats (which only updates on finished episodes)
+        # and mirrors eval/stats.* so we can diagnose hovering early.
+        if ("next", "stats") in data.keys(True, True):
+            live_stats = {
+                "train_live/" + (".".join(k) if isinstance(k, tuple) else k): v[:, -1].float().mean().item()
+                for k, v in data[("next", "stats")].items(True, True)
+            }
+            info.update(live_stats)
+
         # Calculate and log training episode stats
         episode_stats.add(data)
         if len(episode_stats) >= transformed_env.num_envs: # evaluate once if all agents finished one episode
@@ -105,7 +115,7 @@ def main(cfg):
             info.update(stats)
 
         # Evaluate policy and log info
-        if i % cfg.eval_interval == 0:
+        if i > 0 and i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
             eval_info = evaluate(
                 env=transformed_env, 
