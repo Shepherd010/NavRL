@@ -105,12 +105,15 @@ def main(cfg):
         # Log real-time training status from the latest frame in this batch.
         # This complements EpisodeStats (which only updates on finished episodes)
         # and mirrors eval/stats.* so we can diagnose hovering early.
-        if ("next", "stats") in data.keys(True, True):
+        # Direct access with try/except — avoids TorchRL NestedKey vs tuple comparison bug.
+        try:
             live_stats = {
                 "train_live/" + (".".join(k) if isinstance(k, tuple) else k): v[:, -1].float().mean().item()
-                for k, v in data[("next", "stats")].items(True, True)
+                for k, v in data["next", "stats"].items(True, True)
             }
             info.update(live_stats)
+        except (KeyError, Exception):
+            pass
 
         # Calculate and log training episode stats
         episode_stats.add(data)
@@ -154,7 +157,7 @@ def main(cfg):
 
                 # ── Build reward-bar dict (V3 / Panel B of nav_dashboard) ─────────
                 rbar = None
-                if ("next", "stats") in data.keys(True, True):
+                try:
                     raw = data["next", "stats"]
                     _reward_key_map = {
                         "reward_vel":       ("vel",          +1.0),
@@ -170,15 +173,19 @@ def main(cfg):
                             _tmp[display] = sign * float(raw[rk][:, -1].float().mean().item())
                     if _tmp:
                         rbar = _tmp
+                except (KeyError, Exception):
+                    pass
 
                 # ── Accumulate value & distance history (Panel C of nav_dashboard) ─
-                _val_scalar  = float(viz_data["value"].mean().item()) \
-                               if viz_data.get("value") is not None else None
+                _val_scalar = float(viz_data["value"].mean().item()) \
+                              if viz_data.get("value") is not None else None
                 _dist_scalar = None
-                if ("next", "stats") in data.keys(True, True):
-                    raw = data["next", "stats"]
-                    if "distance_to_goal" in raw.keys():
-                        _dist_scalar = float(raw["distance_to_goal"][:, -1].float().mean().item())
+                try:
+                    raw_stats = data["next", "stats"]
+                    if "distance_to_goal" in raw_stats.keys():
+                        _dist_scalar = float(raw_stats["distance_to_goal"][:, -1].float().mean().item())
+                except (KeyError, Exception):
+                    pass
                 if _val_scalar is not None:
                     _value_history.append(_val_scalar)
                 if _dist_scalar is not None:
@@ -188,12 +195,15 @@ def main(cfg):
                 if len(_distance_history) > 100: _distance_history = _distance_history[-100:]
 
                 # ── V4 trajectory segments ───────────────────────────────────────
-                np_key = ("agents", "observation", "node_positions")
-                if np_key in data.keys(True, True):
-                    ego_pos = data[np_key][0, :, 0, :].cpu()  # (T, 3)
+                # Direct key access (no NestedKey in-check) to avoid TorchRL version
+                # incompatibility where tuple != NestedKey in generator comparison.
+                try:
+                    ego_pos = data["agents", "observation", "node_positions"][0, :, 0, :].cpu()
                     _traj_segs.append(ego_pos)
                     if len(_traj_segs) > 16:
                         _traj_segs = _traj_segs[-16:]
+                except (KeyError, Exception):
+                    pass
 
                 # ── Composite figure 1: Navigation Dashboard (V1 + V3 + curves) ──
                 nav_fig = viz_lib.plot_nav_dashboard(
