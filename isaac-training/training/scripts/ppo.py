@@ -377,7 +377,7 @@ class PPO(TensorDictModuleBase):
         tensordict = mode_or_tensordict
         super().train(True)
 
-        """PPO training update. Works for both cnn and graph modes."""
+        # PPO training update path. Works for both cnn and graph modes.
         next_tensordict = tensordict["next"]
 
         rewards = tensordict["next", "agents", "reward"]
