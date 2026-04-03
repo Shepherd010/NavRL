@@ -364,7 +364,19 @@ class PPO(TensorDictModuleBase):
             self.feature_extractor(tensordict)
             return self.critic(tensordict)["state_value"]
 
-    def train(self, tensordict):
+    def train(self, mode_or_tensordict=True):
+        """Support both nn.Module.train(mode) and PPO train(update_td).
+
+        PyTorch calls ``self.train(False)`` from ``eval()``. This class also exposes
+        the historical ``policy.train(tensordict)`` API used by the training loop.
+        Dispatch on argument type so both semantics remain valid.
+        """
+        if isinstance(mode_or_tensordict, bool):
+            return super().train(mode_or_tensordict)
+
+        tensordict = mode_or_tensordict
+        super().train(True)
+
         """PPO training update. Works for both cnn and graph modes."""
         next_tensordict = tensordict["next"]
 
