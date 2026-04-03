@@ -62,6 +62,29 @@ def main(cfg):
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
                  topo_cfg=_topo_cfg)
 
+    # Optional frozen-teacher distillation module for graph_ppo.
+    # Independent switch: disabled by default, no behavior change when off.
+    distill_enabled = bool(OmegaConf.select(cfg, 'teacher_distill.enabled', default=False))
+    if distill_enabled and OmegaConf.select(cfg, 'mode', default='ppo') == 'graph_ppo':
+        teacher_policy = PPO(
+            cfg.algo,
+            transformed_env.observation_spec,
+            transformed_env.action_spec,
+            cfg.device,
+            topo_cfg=None,
+        )
+        teacher_ckpt = OmegaConf.select(cfg, 'teacher_distill.checkpoint', default=None)
+        if teacher_ckpt is None:
+            raise ValueError("teacher_distill.enabled=true but teacher_distill.checkpoint is missing")
+        teacher_state = torch.load(teacher_ckpt, map_location=cfg.device)
+        teacher_policy.load_state_dict(teacher_state, strict=True)
+        teacher_policy.eval()
+        for p in teacher_policy.parameters():
+            p.requires_grad = False
+
+        policy.enable_teacher_distill(teacher_policy, cfg.teacher_distill)
+        print(f"[NavRL]: enabled teacher distillation from checkpoint: {teacher_ckpt}")
+
     # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
     # checkpoint = "/home/xinmingh/RLDrones/navigation/scripts/nav-ros/navigation_runner/ckpts/checkpoint_36000.pt"
     # policy.load_state_dict(torch.load(checkpoint))

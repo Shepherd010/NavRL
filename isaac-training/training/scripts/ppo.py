@@ -27,6 +27,14 @@ class PPO(TensorDictModuleBase):
         super().__init__()
         self.cfg = cfg
         self.device = device
+        # Optional frozen-teacher distillation module (off by default).
+        self.teacher_distill_enabled = False
+        self.teacher_policy = None
+        self.teacher_distill_weight = 0.0
+        self.teacher_distill_min_weight = 0.0
+        self.teacher_distill_warmup_steps = 0
+        self.teacher_distill_decay_steps = 0
+        self._graph_update_steps = 0
 
         # Detect graph_ppo mode from observation spec
         _obs_keys = set(observation_spec["agents"]["observation"].keys())
@@ -161,6 +169,67 @@ class PPO(TensorDictModuleBase):
                 nn.init.constant_(module.bias, 0.)
         self.actor.apply(init_)
         self.critic.apply(init_)
+
+    # ------------------------------------------------------------------
+    # Optional Teacher Distillation (graph_ppo)
+    # ------------------------------------------------------------------
+
+    def enable_teacher_distill(self, teacher_policy, distill_cfg):
+        """Attach a frozen CNN-PPO teacher for graph_ppo velocity distillation."""
+        self.teacher_policy = teacher_policy
+        self.teacher_distill_enabled = True
+        self.teacher_distill_weight = float(getattr(distill_cfg, 'weight', 1.0))
+        self.teacher_distill_min_weight = float(getattr(distill_cfg, 'min_weight', 0.0))
+        self.teacher_distill_warmup_steps = int(getattr(distill_cfg, 'warmup_steps', 0))
+        self.teacher_distill_decay_steps = int(getattr(distill_cfg, 'decay_steps', 0))
+
+    def _teacher_distill_weight_now(self):
+        if not self.teacher_distill_enabled:
+            return 0.0
+
+        base_w = self.teacher_distill_weight
+        min_w = self.teacher_distill_min_weight
+        step = self._graph_update_steps
+        warmup = self.teacher_distill_warmup_steps
+        decay = self.teacher_distill_decay_steps
+
+        if step < warmup:
+            return base_w
+        if decay <= 0:
+            return min_w
+
+        p = min(1.0, float(step - warmup) / float(decay))
+        return base_w + (min_w - base_w) * p
+
+    @torch.no_grad()
+    def _teacher_velocity_from_obs(self, tensordict):
+        """Run frozen CNN teacher on current obs and return world-frame velocity (B, 3)."""
+        if self.teacher_policy is None:
+            raise RuntimeError("Teacher distillation is enabled but teacher_policy is None")
+
+        td_teacher = TensorDict({
+            "agents": TensorDict({
+                "observation": TensorDict({
+                    "lidar": tensordict["agents", "observation", "lidar"],
+                    "dynamic_obstacle": tensordict["agents", "observation", "dynamic_obstacle"],
+                    "state": tensordict["agents", "observation", "state"],
+                    "direction": tensordict["agents", "observation", "direction"],
+                }, batch_size=tensordict.batch_size),
+            }, batch_size=tensordict.batch_size),
+        }, batch_size=tensordict.batch_size, device=self.device)
+
+        self.teacher_policy.feature_extractor(td_teacher)
+        self.teacher_policy.actor.module(td_teacher)
+        alpha = td_teacher["alpha"]
+        beta = td_teacher["beta"]
+        action_norm = alpha / (alpha + beta).clamp_min(1e-6)
+        action_local = (2 * action_norm * self.teacher_policy.cfg.actor.action_limit) - self.teacher_policy.cfg.actor.action_limit
+        action_world = vec_to_world(action_local, td_teacher["agents", "observation", "direction"])
+
+        # Keep shape (B, 3) for distillation target.
+        if action_world.dim() == 3:
+            action_world = action_world.squeeze(1)
+        return action_world
 
     # ------------------------------------------------------------------
     # Forward
@@ -346,6 +415,7 @@ class PPO(TensorDictModuleBase):
     def _update_graph(self, tensordict):
         """Graph PPO minibatch update (Categorical action)."""
         node_features = tensordict["agents", "observation", "node_features"]
+        node_positions = tensordict["agents", "observation", "node_positions"]
         edge_features = tensordict["agents", "observation", "edge_features"]
         node_mask     = tensordict["agents", "observation", "node_mask"].bool()
         edge_mask     = tensordict["agents", "observation", "edge_mask"].bool()
@@ -386,7 +456,32 @@ class PPO(TensorDictModuleBase):
         value_clipped = b_value + (value - b_value).clamp(-self.cfg.critic.clip_ratio, self.cfg.critic.clip_ratio)
         critic_loss  = torch.max(self.critic_loss_fn(ret, value_clipped), self.critic_loss_fn(ret, value))
 
-        loss = entropy_loss + actor_loss + critic_loss
+        distill_loss = torch.zeros([], device=self.device)
+        distill_weight = 0.0
+        if self.teacher_distill_enabled and self.teacher_policy is not None:
+            # Student expected velocity from graph action probabilities.
+            # Candidate nodes exclude ego node at index 0.
+            ego_pos = node_positions[:, :1, :]               # (B, 1, 3)
+            cand_pos = node_positions[:, 1:, :]              # (B, N, 3)
+            dir_vec = cand_pos - ego_pos                     # (B, N, 3)
+            dist = dir_vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            dt_low = 1.0 / 10.0
+            speed = torch.minimum(
+                torch.full_like(dist, self.v_target),
+                dist / dt_low,
+            )
+            cand_vel = (dir_vec / dist) * speed              # (B, N, 3)
+            cand_vel = cand_vel.clone()
+            cand_vel[..., 2] = 0.0
+            v_student = (probs.unsqueeze(-1) * cand_vel).sum(dim=1)  # (B, 3)
+
+            # Frozen teacher target velocity from the same minibatch observations.
+            v_teacher = self._teacher_velocity_from_obs(tensordict).to(v_student.dtype)
+
+            distill_loss = F.mse_loss(v_student, v_teacher)
+            distill_weight = self._teacher_distill_weight_now()
+
+        loss = entropy_loss + actor_loss + critic_loss + (distill_weight * distill_loss)
         self.graph_actor_optim.zero_grad(set_to_none=True)
         self.graph_critic_optim.zero_grad(set_to_none=True)
         if self._scaler is not None:
@@ -408,6 +503,7 @@ class PPO(TensorDictModuleBase):
             self.graph_critic_optim.step()
 
         explained_var = 1 - F.mse_loss(value, ret) / ret.var()
+        self._graph_update_steps += 1
         return TensorDict({
             "actor_loss":      actor_loss,
             "critic_loss":     critic_loss,
@@ -415,6 +511,8 @@ class PPO(TensorDictModuleBase):
             "actor_grad_norm": actor_grad_norm,
             "critic_grad_norm": critic_grad_norm,
             "explained_var":   explained_var,
+            "distill_loss":    distill_loss,
+            "distill_weight":  torch.tensor(distill_weight, device=self.device),
         }, [])
 
     @torch.no_grad()

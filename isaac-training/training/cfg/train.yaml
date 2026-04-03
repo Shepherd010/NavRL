@@ -53,3 +53,13 @@ wandb:
 # Only active for graph_ppo mode; uses matplotlib + PIL, no GPU needed.
 viz:
   interval: 50   # log viz images to WandB every N training steps
+
+# Optional frozen-teacher distillation module for graph_ppo.
+# Fully separated switch: when disabled, training path is unchanged.
+teacher_distill:
+  enabled: false
+  checkpoint: "/home/worku22/code/NavRL/ros1/navigation_runner/scripts/ckpts/navrl_checkpoint.pt"
+  weight: 1.0
+  min_weight: 0.05
+  warmup_steps: 20000
+  decay_steps: 200000
