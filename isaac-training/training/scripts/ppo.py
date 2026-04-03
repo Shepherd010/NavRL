@@ -12,6 +12,15 @@ from torchrl.envs.transforms import CatTensors
 from utils import ValueNorm, make_mlp, IndependentNormal, Actor, GAE, make_batch, IndependentBeta, BetaActor, vec_to_world
 
 
+def _resolve_amp_dtype(device: str) -> torch.dtype | None:
+    """Return BF16 if supported, FP16 as fallback, None if CUDA unavailable."""
+    if not torch.cuda.is_available():
+        return None
+    # BF16: safer for RL (no loss of dynamic range vs FP16's narrow range)
+    if torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
 
 class PPO(TensorDictModuleBase):
     def __init__(self, cfg, observation_spec, action_spec, device, topo_cfg=None):
@@ -67,6 +76,17 @@ class PPO(TensorDictModuleBase):
         _gamma = float(getattr(self.cfg, 'gamma', 0.995))
         self.gae            = GAE(_gamma, 0.95)
         self.critic_loss_fn = nn.HuberLoss(delta=10)
+
+        # AMP setup: BF16 preferred, FP16 fallback, disabled if no CUDA.
+        # ValueNorm, GAE, and HuberLoss stay in FP32 (handled outside autocast).
+        self._amp_dtype = _resolve_amp_dtype(self.device)
+        self._amp_enabled = self._amp_dtype is not None
+        # GradScaler only needed for FP16 (BF16 has no underflow problem)
+        self._scaler = (
+            torch.cuda.amp.GradScaler()
+            if (self._amp_enabled and self._amp_dtype == torch.float16)
+            else None
+        )
 
         self.graph_optim = torch.optim.Adam(
             list(self.graph_transformer.parameters()) +
@@ -175,9 +195,14 @@ class PPO(TensorDictModuleBase):
             spd_matrix = self.graph_transformer._compute_spd_matrix(edge_mask)  # (B, N+1, N+1)
             tensordict["_spd_matrix"] = spd_matrix
 
-        # Graph transformer \u2192 probs (B, N), h (B, N+1, hidden_dim)
-        probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask,
-                                          spd_matrix=spd_matrix)
+        # Graph transformer → probs (B, N), h (B, N+1, hidden_dim)
+        # Run under AMP autocast for 2-3× Transformer speedup.
+        with torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=self._amp_dtype):
+            probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask,
+                                              spd_matrix=spd_matrix)
+        # Upcast to FP32 before Categorical / arithmetic (stability)
+        probs = probs.float()
+        h     = h.float()
 
         # Sample action from Categorical distribution
         dist       = Categorical(probs=probs)
@@ -198,6 +223,11 @@ class PPO(TensorDictModuleBase):
             _dist / _dt_low,
         )
         vel_w     = (dir_vec / _dist) * _speed                   # (B, 3)
+        # Nodes are projected to ego Z — the Z component of dir_vec is always ~0
+        # but floating-point noise can accumulate; zero it explicitly so
+        # LeePositionController never receives a spurious climb/dive command.
+        vel_w = vel_w.clone()
+        vel_w[:, 2] = 0.0
 
         # Critic value from ego embedding
         h_ego     = h[:, 0, :]                                   # (B, hidden_dim)
@@ -245,12 +275,13 @@ class PPO(TensorDictModuleBase):
                     spd_chunk = None
                     if "_spd_matrix" in flat_td.keys():
                         spd_chunk = flat_td["_spd_matrix"][start:end]
-                    _, h = self.graph_transformer(
-                        node_features[start:end], edge_features[start:end],
-                        node_mask[start:end],     edge_mask[start:end],
-                        spd_matrix=spd_chunk,
-                    )
-                    h_ego = h[:, 0, :]              # (chunk, hidden_dim)
+                    with torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=self._amp_dtype):
+                        _, h = self.graph_transformer(
+                            node_features[start:end], edge_features[start:end],
+                            node_mask[start:end],     edge_mask[start:end],
+                            spd_matrix=spd_chunk,
+                        )
+                    h_ego = h[:, 0, :].float()              # (chunk, hidden_dim) – FP32
                     v = self.graph_critic_mlp(torch.cat([h_ego, drone_state[start:end]], dim=-1))
                     chunks.append(v)
             values = torch.cat(chunks, dim=0)       # (B*T, 1)
@@ -318,13 +349,17 @@ class PPO(TensorDictModuleBase):
         # Reuse SPD matrix cached during rollout — avoids Floyd-Warshall on every minibatch
         spd_matrix = tensordict.get("_spd_matrix", None)
 
-        probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask,
-                                          spd_matrix=spd_matrix)
+        with torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=self._amp_dtype):
+            probs, h = self.graph_transformer(node_features, edge_features, node_mask, edge_mask,
+                                              spd_matrix=spd_matrix)
+        # Upcast to FP32 before loss computation (Categorical, log_prob, PPO ratio)
+        probs = probs.float()
+        h     = h.float()
         dist           = Categorical(probs=probs)
         log_probs      = dist.log_prob(tensordict["graph_action"])   # (B,)
         action_entropy = dist.entropy()                             # (B,)
 
-        # Critic
+        # Critic (FP32 headcritical for numerical stability in value loss)
         h_ego  = h[:, 0, :]
         value  = self.graph_critic_mlp(torch.cat([h_ego, drone_state], dim=-1))  # (B, 1)
 
@@ -348,10 +383,20 @@ class PPO(TensorDictModuleBase):
 
         loss = entropy_loss + actor_loss + critic_loss
         self.graph_optim.zero_grad(set_to_none=True)
-        loss.backward()
-        all_params = list(self.graph_transformer.parameters()) + list(self.graph_critic_mlp.parameters())
-        grad_norm  = nn.utils.clip_grad.clip_grad_norm_(all_params, max_norm=5.)
-        self.graph_optim.step()
+        if self._scaler is not None:
+            # FP16 path: scale loss to prevent underflow then unscale before clip
+            self._scaler.scale(loss).backward()
+            self._scaler.unscale_(self.graph_optim)
+            all_params = list(self.graph_transformer.parameters()) + list(self.graph_critic_mlp.parameters())
+            grad_norm  = nn.utils.clip_grad.clip_grad_norm_(all_params, max_norm=5.)
+            self._scaler.step(self.graph_optim)
+            self._scaler.update()
+        else:
+            # BF16 or FP32: no scaler needed
+            loss.backward()
+            all_params = list(self.graph_transformer.parameters()) + list(self.graph_critic_mlp.parameters())
+            grad_norm  = nn.utils.clip_grad.clip_grad_norm_(all_params, max_norm=5.)
+            self.graph_optim.step()
 
         explained_var = 1 - F.mse_loss(value, ret) / ret.var()
         return TensorDict({
@@ -379,9 +424,12 @@ class PPO(TensorDictModuleBase):
         edge_mask      = tensordict["agents", "observation", "edge_mask"][:1].bool()
         drone_state    = tensordict["agents", "observation", "state"][:1]
 
-        probs, h, all_attn = self.graph_transformer.forward_with_attn(
-            node_features, edge_features, node_mask, edge_mask
-        )
+        with torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=self._amp_dtype):
+            probs, h, all_attn = self.graph_transformer.forward_with_attn(
+                node_features, edge_features, node_mask, edge_mask
+            )
+        probs = probs.float()
+        h     = h.float()
 
         h_ego  = h[:, 0, :]
         value  = self.graph_critic_mlp(torch.cat([h_ego, drone_state], dim=-1))

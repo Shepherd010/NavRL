@@ -65,7 +65,8 @@ class TopoExtractor:
 
         # ---------- 2. Voronoi nodes (local ego-frame) ----------
         nodes_local, clearances, nodes_mask = self._find_voronoi_nodes(
-            dist_field, gradient, grid_xy
+            dist_field, gradient, grid_xy,
+            ego_pos=ray_pos_w, target_pos=target_pos,
         )
         # nodes_local : (B, max_nodes, 3)  xy local + z=0
         # nodes_mask  : (B, max_nodes)     bool
@@ -173,8 +174,12 @@ class TopoExtractor:
 
         grid_res = 2.0 * grid_range / H
 
-        # Handle inf / nan
-        dist_field = dist_field.nan_to_num(nan=grid_range, posinf=grid_range)
+        # Handle inf / nan:
+        # Cells with no valid ray-hit (open space beyond lidar range) must be 0.0,
+        # NOT grid_range.  Filling with grid_range would create spurious "high-clearance"
+        # zones behind / outside the sensor range and cause Voronoi nodes to be placed
+        # there, driving the drone backwards.
+        dist_field = dist_field.nan_to_num(nan=0.0, posinf=0.0)
         dist_field = dist_field.clamp(min=1e-4, max=grid_range)
 
         # Gradient (central difference)
@@ -199,9 +204,11 @@ class TopoExtractor:
 
     def _find_voronoi_nodes(
         self,
-        dist_field: torch.Tensor,  # (B, H, W)
-        gradient:   torch.Tensor,  # (B, H, W, 2)
-        grid_xy:    torch.Tensor,  # (H, W, 2)  ego-local frame
+        dist_field:  torch.Tensor,           # (B, H, W)
+        gradient:    torch.Tensor,           # (B, H, W, 2)
+        grid_xy:     torch.Tensor,           # (H, W, 2)  ego-local frame
+        ego_pos:     torch.Tensor | None = None,  # (B, 3) world frame — for goal bias
+        target_pos:  torch.Tensor | None = None,  # (B, 3) world frame — for goal bias
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Extract Voronoi-diagram nodes from the 2-D distance field.
 
@@ -216,6 +223,8 @@ class TopoExtractor:
             dist_field: (B, H, W) 2-D distance-to-obstacle field.
             gradient:   (B, H, W, 2) spatial gradient of dist_field.
             grid_xy:    (H, W, 2) pixel centres in ego-local XY frame.
+            ego_pos:    (B, 3) world-frame ego position (optional; enables goal-direction bias).
+            target_pos: (B, 3) world-frame goal position (optional; enables goal-direction bias).
 
         Returns:
             nodes_local : (B, max_nodes, 3)  XY in ego-local frame, Z=0.
@@ -249,6 +258,19 @@ class TopoExtractor:
                                  torch.zeros(B, pool_size, 1, device=device)], dim=-1)  # (B,K,3)
         pool_score = topk_vals                                           # (B, K)
         pool_valid = pool_score > -1e8                                   # (B, K) bool
+
+        # -- Goal-direction bias: reward nodes that lie along the path to the goal.
+        # Uses ego-local XY (pool_xy is already relative to ego).
+        # Weight: 0.3 * goal_proj_norm is small enough that safety/clearance still
+        # dominates, but provides a tiebreak between equi-clearance corridors.
+        if ego_pos is not None and target_pos is not None:
+            goal_xy   = target_pos[:, :2] - ego_pos[:, :2]        # (B, 2) local goal dir
+            goal_n    = F.normalize(goal_xy, dim=-1)               # (B, 2) unit
+            # projection of each candidate in ego-local XY onto goal direction
+            proj      = (pool_xy * goal_n.unsqueeze(1)).sum(-1)    # (B, K) ∈ [-R, +R] m
+            proj_n    = proj / float(self.lidar_range)             # (B, K) ∈ [-1, +1]
+            goal_bonus = 0.3 * proj_n * pool_valid.float()         # only valid candidates
+            pool_score = pool_score + goal_bonus
 
         # -- Vectorized greedy NMS over the pool --
         nodes_local, clearances, node_mask = self._nms_batched(
@@ -293,14 +315,13 @@ class TopoExtractor:
         suppressed = ~valid.clone()  # (B, K): True = should not be selected
 
         for slot in range(N):
-            # Pick highest-score non-suppressed candidate per batch
-            masked_scores = scores.clone()
-            masked_scores[suppressed] = -1e9
-            best_score, best_idx = masked_scores.max(dim=1)  # (B,), (B,)
+            # Pick highest-score non-suppressed candidate per batch.
+            # Use masked_fill to avoid a clone + index-set; also avoids the
+            # GPU→CPU sync that "if not any_valid.any(): break" would cause
+            # (24 syncs per env-step with the old early-exit pattern).
+            best_score, best_idx = scores.masked_fill(suppressed, -1e9).max(dim=1)
 
             any_valid = best_score > -1e8                     # (B,) bool
-            if not any_valid.any():
-                break
 
             # Gather best position for each batch element
             best_pos = positions[torch.arange(B, device=device), best_idx]  # (B, 3)
@@ -314,8 +335,7 @@ class TopoExtractor:
 
             # Suppress all candidates within radius of the chosen node (vectorized)
             dists = (positions - best_pos.unsqueeze(1)).norm(dim=-1)  # (B, K)
-            too_close = dists <= radius
-            suppressed = suppressed | (too_close & ~suppressed)
+            suppressed = suppressed | (dists <= radius)
 
         return out_pos, out_score, out_mask
 
