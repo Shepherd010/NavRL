@@ -536,11 +536,20 @@ class TopoExtractor:
         # Nearest dynamic obstacle distance to edge midpoint (1)
         mid_pos = (pi + pj) / 2.0  # (B, N+1, N+1, 3)
         if dyn_obs.shape[1] > 0:
-            obs_pos = dyn_obs[:, :, :3]           # (B, N_dyn, 3)
-            # (B, N+1, N+1, N_dyn)
-            diffs = mid_pos.unsqueeze(-2) - obs_pos.unsqueeze(1).unsqueeze(1)
-            dyn_dists = diffs.norm(dim=-1)         # (B, N+1, N+1, N_dyn)
-            min_dyn_dist = dyn_dists.min(dim=-1).values.unsqueeze(-1)  # (B, N+1, N+1, 1)
+            obs_pos = dyn_obs[:, :, :3]  # (B, N_dyn, 3)
+            N_dyn   = obs_pos.shape[1]
+            # Chunked over N_dyn to avoid the full (B, N+1, N+1, N_dyn, 3) materialisation.
+            # Peak VRAM per chunk = B × Np1 × Np1 × _DYN_CHUNK × 3 × 4 bytes.
+            # _DYN_CHUNK=16, B=32, Np1=25 → ~37 MB per chunk regardless of total N_dyn.
+            _DYN_CHUNK = 16
+            min_dyn_dist = torch.full((B, Np1, Np1), float(self.lidar_range), device=device)
+            for d0 in range(0, N_dyn, _DYN_CHUNK):
+                d1     = min(d0 + _DYN_CHUNK, N_dyn)
+                obs_c  = obs_pos[:, d0:d1, :]                          # (B, dc, 3)
+                diff_c = mid_pos.unsqueeze(3) - obs_c[:, None, None, :, :]  # (B, Np1, Np1, dc, 3)
+                d_c    = diff_c.norm(dim=-1).min(dim=-1).values        # (B, Np1, Np1)
+                min_dyn_dist = torch.minimum(min_dyn_dist, d_c)
+            min_dyn_dist = min_dyn_dist.unsqueeze(-1)                  # (B, Np1, Np1, 1)
         else:
             min_dyn_dist = torch.full((B, Np1, Np1, 1), self.lidar_range, device=device)
 

@@ -4,7 +4,7 @@
 
 topo:
   # ----- TopoExtractor -----
-  max_nodes: 24                  # reduced for lower O(N^2) attention cost, total N+1 = 25
+  max_nodes: 40                  # reduced for lower O(N^2) attention cost, total N+1 = 25
   node_feat_dim: 18
   edge_feat_dim: 8                # 3(rel_pos)+1(elen)+1(dyn_dist)+3(dir)
   lidar_range: 10.0              # must match sensor.lidar_range in train.yaml
@@ -23,7 +23,7 @@ topo:
   dropout: 0.1
   # Complexity reduction switches
   use_topo_bias: false           # disable edge/spd bias MLPs (largest NxN cost outside QK)
-  use_spd_bias: false            # disable Floyd-Warshall + SPD bias
+  use_spd_bias: true            # disable Floyd-Warshall + SPD bias
   sparse_topk: 8                # sparse attention per query node: O(N*K), K<<N
   value_chunk_size: 1024         # shift-trick reduces next_values to 1 forward pass (1024 samples) — fits in one chunk
 

@@ -88,10 +88,15 @@ class PPO(TensorDictModuleBase):
             else None
         )
 
-        self.graph_optim = torch.optim.Adam(
-            list(self.graph_transformer.parameters()) +
-            list(self.graph_critic_mlp.parameters()),
+        # Separate optimisers for actor (transformer) and critic (mlp) so that
+        # their learning rates can be tuned independently (key for stable PPO).
+        self.graph_actor_optim = torch.optim.Adam(
+            self.graph_transformer.parameters(),
             lr=float(self.cfg.actor.learning_rate),
+        )
+        self.graph_critic_optim = torch.optim.Adam(
+            self.graph_critic_mlp.parameters(),
+            lr=float(self.cfg.critic.learning_rate),
         )
 
     def _build_cnn_ppo(self, cfg, observation_spec, action_spec):
@@ -382,29 +387,33 @@ class PPO(TensorDictModuleBase):
         critic_loss  = torch.max(self.critic_loss_fn(ret, value_clipped), self.critic_loss_fn(ret, value))
 
         loss = entropy_loss + actor_loss + critic_loss
-        self.graph_optim.zero_grad(set_to_none=True)
+        self.graph_actor_optim.zero_grad(set_to_none=True)
+        self.graph_critic_optim.zero_grad(set_to_none=True)
         if self._scaler is not None:
-            # FP16 path: scale loss to prevent underflow then unscale before clip
+            # FP16 path: scale loss, unscale each optimizer separately, then clip & step
             self._scaler.scale(loss).backward()
-            self._scaler.unscale_(self.graph_optim)
-            all_params = list(self.graph_transformer.parameters()) + list(self.graph_critic_mlp.parameters())
-            grad_norm  = nn.utils.clip_grad.clip_grad_norm_(all_params, max_norm=5.)
-            self._scaler.step(self.graph_optim)
+            self._scaler.unscale_(self.graph_actor_optim)
+            self._scaler.unscale_(self.graph_critic_optim)
+            actor_grad_norm  = nn.utils.clip_grad.clip_grad_norm_(self.graph_transformer.parameters(), max_norm=5.)
+            critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.graph_critic_mlp.parameters(), max_norm=5.)
+            self._scaler.step(self.graph_actor_optim)
+            self._scaler.step(self.graph_critic_optim)
             self._scaler.update()
         else:
             # BF16 or FP32: no scaler needed
             loss.backward()
-            all_params = list(self.graph_transformer.parameters()) + list(self.graph_critic_mlp.parameters())
-            grad_norm  = nn.utils.clip_grad.clip_grad_norm_(all_params, max_norm=5.)
-            self.graph_optim.step()
+            actor_grad_norm  = nn.utils.clip_grad.clip_grad_norm_(self.graph_transformer.parameters(), max_norm=5.)
+            critic_grad_norm = nn.utils.clip_grad.clip_grad_norm_(self.graph_critic_mlp.parameters(), max_norm=5.)
+            self.graph_actor_optim.step()
+            self.graph_critic_optim.step()
 
         explained_var = 1 - F.mse_loss(value, ret) / ret.var()
         return TensorDict({
             "actor_loss":      actor_loss,
             "critic_loss":     critic_loss,
             "entropy":         entropy_loss,
-            "actor_grad_norm": grad_norm,
-            "critic_grad_norm": grad_norm,
+            "actor_grad_norm": actor_grad_norm,
+            "critic_grad_norm": critic_grad_norm,
             "explained_var":   explained_var,
         }, [])
 

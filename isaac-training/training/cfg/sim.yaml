@@ -2,7 +2,7 @@ sim:
   dt: 0.016
   substeps: 1
   gravity: [0, 0, -9.81]
-  replicate_physics: false
+  replicate_physics: true
   use_flatcache: true
   use_gpu_pipeline: true
   device: "cuda:0"

@@ -42,9 +42,9 @@ class NavigationEnv(IsaacEnv):
         #   edge          → original curriculum: spawn on 4 edges of the map
         #   interior_safe → sample from valid flat interior patches (free space between obstacles)
         self.spawn_mode = str(OmegaConf.select(cfg, 'env.spawn_mode', default='edge'))
-        self.interior_spawn_num_patches = int(OmegaConf.select(cfg, 'env.interior_spawn_num_patches', default=4096))
-        self.interior_spawn_patch_radius = float(OmegaConf.select(cfg, 'env.interior_spawn_patch_radius', default=0.45))
-        self.interior_spawn_max_height_diff = float(OmegaConf.select(cfg, 'env.interior_spawn_max_height_diff', default=0.05))
+        self.interior_spawn_num_patches = int(OmegaConf.select(cfg, 'env.interior_spawn_num_patches', default=512))
+        self.interior_spawn_patch_radius = float(OmegaConf.select(cfg, 'env.interior_spawn_patch_radius', default=0.30))
+        self.interior_spawn_max_height_diff = float(OmegaConf.select(cfg, 'env.interior_spawn_max_height_diff', default=0.10))
 
         # Graph-based topology navigation modules.
         # Require BOTH use_topo=true AND mode='graph_ppo' to be active.
@@ -170,6 +170,29 @@ class NavigationEnv(IsaacEnv):
         self.z_terminate_min = 0.2
         self.z_terminate_max = 4.0
 
+        obstacle_cfg_kwargs = dict(
+            horizontal_scale=0.1,
+            vertical_scale=0.1,
+            border_width=0.0,
+            num_obstacles=self.cfg.env.num_obstacles,
+            obstacle_height_mode="range",
+            obstacle_width_range=(0.4, 1.1),
+            obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
+            obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
+            platform_width=0.0,
+        )
+        if self.spawn_mode == "interior_safe":
+            obstacle_cfg_kwargs["flat_patch_sampling"] = {
+                "init_pos": FlatPatchSamplingCfg(
+                    num_patches=self.interior_spawn_num_patches,
+                    patch_radius=self.interior_spawn_patch_radius,
+                    x_range=(-self.map_range[0] + 1.0, self.map_range[0] - 1.0),
+                    y_range=(-self.map_range[1] + 1.0, self.map_range[1] - 1.0),
+                    z_range=(-0.05, 0.15),
+                    max_height_diff=self.interior_spawn_max_height_diff,
+                ),
+            }
+
         terrain_cfg = TerrainImporterCfg(
             num_envs=self.num_envs,
             env_spacing=0.0,
@@ -187,30 +210,7 @@ class NavigationEnv(IsaacEnv):
                 use_cache=False,
                 color_scheme="height",
                 sub_terrains={
-                    "obstacles": HfDiscreteObstaclesTerrainCfg(
-                        horizontal_scale=0.1,
-                        vertical_scale=0.1,
-                        border_width=0.0,
-                        num_obstacles=self.cfg.env.num_obstacles,
-                        obstacle_height_mode="range",
-                        obstacle_width_range=(0.4, 1.1),
-                        obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
-                        obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
-                        platform_width=0.0,
-                        # Pre-sample valid interior free-space patches so interior_safe spawn mode
-                        # can sample from obstacle-free empty ground without doing expensive mesh
-                        # collision queries inside every _reset_idx call.
-                        flat_patch_sampling={
-                            "init_pos": FlatPatchSamplingCfg(
-                                num_patches=self.interior_spawn_num_patches,
-                                patch_radius=self.interior_spawn_patch_radius,
-                                x_range=(-self.map_range[0] + 1.0, self.map_range[0] - 1.0),
-                                y_range=(-self.map_range[1] + 1.0, self.map_range[1] - 1.0),
-                                z_range=(-0.05, 0.15),
-                                max_height_diff=self.interior_spawn_max_height_diff,
-                            ),
-                        },
-                    ),
+                    "obstacles": HfDiscreteObstaclesTerrainCfg(**obstacle_cfg_kwargs),
                 },
             ),
             visual_material = None,
@@ -218,7 +218,16 @@ class NavigationEnv(IsaacEnv):
             collision_group=-1,
             debug_vis=True,
         )
-        self.terrain_importer = TerrainImporter(terrain_cfg)
+        try:
+            self.terrain_importer = TerrainImporter(terrain_cfg)
+        except RuntimeError as exc:
+            if self.spawn_mode == "interior_safe" and "Failed to find valid patches" in str(exc):
+                raise RuntimeError(
+                    "interior_safe 出生模式初始化失败：当前地形中过少可用空地，无法采样足够的 flat patches。\n"
+                    "可尝试减小 env.interior_spawn_num_patches、减小 env.interior_spawn_patch_radius，"
+                    "或增大 env.interior_spawn_max_height_diff。"
+                ) from exc
+            raise
 
         if (self.cfg.env_dyn.num_obstacles == 0):
             return

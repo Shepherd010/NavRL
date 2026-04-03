@@ -14,6 +14,6 @@ algo:
   
   entropy_loss_coefficient: 1e-3
   training_frame_num: 32
-  training_epoch_num: 4
-  num_minibatches: 16    # keep at 16: minibatch=2048; halving to 8 doubles edge tensor memory (51×51×heads) → OOM
+  training_epoch_num: 8
+  num_minibatches: 32    # keep at 16: minibatch=2048; halving to 8 doubles edge tensor memory (51×51×heads) → OOM
   gamma: 0.995           # 0.99→0.995: 目标距离20-40m，需要更长 horizon 才能学到跨远粿划

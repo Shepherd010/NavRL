@@ -75,15 +75,23 @@ class SafetyShieldQP:
         obs_np   = obstacles.detach().cpu().numpy()      # (B, N_obs, 7)
         ego_np   = ego_pos.detach().cpu().numpy() if ego_pos is not None else None
 
-        v_safe_list = []
-        intv_list   = []
-        for b in range(B):
+        # Parallel QP solves using a thread pool.
+        # OSQP releases the GIL during its internal C solve, so threads run truly in parallel.
+        # Cap workers at 8 to avoid excessive thread creation on large batches.
+        def _solve_b(b):
             ego_b = ego_np[b] if ego_np is not None else None
-            vs, intv = self._solve_single(v_rl_np[b], obs_np[b], ego_b)
-            v_safe_list.append(vs)
-            intv_list.append(intv)
+            return self._solve_single(v_rl_np[b], obs_np[b], ego_b)
 
-        v_safe      = torch.from_numpy(np.stack(v_safe_list, axis=0)).float().to(device)
+        from concurrent.futures import ThreadPoolExecutor
+        _workers = min(B, 8)
+        if _workers > 1:
+            with ThreadPoolExecutor(max_workers=_workers) as pool:
+                results = list(pool.map(_solve_b, range(B)))
+        else:
+            results = [_solve_b(0)]
+
+        v_safe_list, intv_list = zip(*results)
+        v_safe       = torch.from_numpy(np.stack(v_safe_list, axis=0)).float().to(device)
         intervention = torch.tensor(intv_list, dtype=torch.float32, device=device)
         return v_safe, intervention
 
