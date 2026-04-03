@@ -10,7 +10,7 @@ import omni.isaac.orbit.sim as sim_utils
 # Imported lazily inside __init__ so the file is importable without Isaac when use_topo=False
 from omni_drones.robots.drone import MultirotorBase
 from omni.isaac.orbit.assets import AssetBaseCfg
-from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg
+from omni.isaac.orbit.terrains import TerrainImporterCfg, TerrainImporter, TerrainGeneratorCfg, HfDiscreteObstaclesTerrainCfg, FlatPatchSamplingCfg
 from omni_drones.utils.torch import euler_to_quaternion, quat_axis
 from omni.isaac.orbit.sensors import RayCaster, RayCasterCfg, patterns
 from omni.isaac.core.utils.viewports import set_camera_view
@@ -38,6 +38,13 @@ class NavigationEnv(IsaacEnv):
         self.lidar_vbeams = cfg.sensor.lidar_vbeams
         self.lidar_hres = cfg.sensor.lidar_hres
         self.lidar_hbeams = int(360/self.lidar_hres)
+        # Spawn mode:
+        #   edge          → original curriculum: spawn on 4 edges of the map
+        #   interior_safe → sample from valid flat interior patches (free space between obstacles)
+        self.spawn_mode = str(OmegaConf.select(cfg, 'env.spawn_mode', default='edge'))
+        self.interior_spawn_num_patches = int(OmegaConf.select(cfg, 'env.interior_spawn_num_patches', default=4096))
+        self.interior_spawn_patch_radius = float(OmegaConf.select(cfg, 'env.interior_spawn_patch_radius', default=0.45))
+        self.interior_spawn_max_height_diff = float(OmegaConf.select(cfg, 'env.interior_spawn_max_height_diff', default=0.05))
 
         # Graph-based topology navigation modules.
         # Require BOTH use_topo=true AND mode='graph_ppo' to be active.
@@ -148,7 +155,20 @@ class NavigationEnv(IsaacEnv):
         cfg_ground = sim_utils.GroundPlaneCfg(color=(0.05, 0.05, 0.07), size=(300., 300.))
         cfg_ground.func("/World/defaultGroundPlane", cfg_ground, translation=(0, 0, 0.01))
 
+        # Scene boundary definitions.
+        # map_range: obstacle field half-extent.
+        # terrain_half_extent_*: actual traversable terrain half-extent after adding border.
+        # spawn_target_edge_*: start/goal reset line, kept 1 m inside the terrain edge.
+        # OOB truncation happens exactly at the terrain edge, not at an arbitrary magic number.
         self.map_range = [20.0, 20.0, 4.5]
+        self.terrain_border_width = 2.0
+        self.terrain_half_extent_x = self.map_range[0] + self.terrain_border_width
+        self.terrain_half_extent_y = self.map_range[1] + self.terrain_border_width
+        self.spawn_target_margin_xy = 1.0
+        self.spawn_target_edge_x = self.terrain_half_extent_x - self.spawn_target_margin_xy
+        self.spawn_target_edge_y = self.terrain_half_extent_y - self.spawn_target_margin_xy
+        self.z_terminate_min = 0.2
+        self.z_terminate_max = 4.0
 
         terrain_cfg = TerrainImporterCfg(
             num_envs=self.num_envs,
@@ -158,7 +178,7 @@ class NavigationEnv(IsaacEnv):
             terrain_generator=TerrainGeneratorCfg(
                 seed=0,
                 size=(self.map_range[0]*2, self.map_range[1]*2), 
-                border_width=5.0,
+                border_width=self.terrain_border_width,
                 num_rows=1, 
                 num_cols=1, 
                 horizontal_scale=0.1,
@@ -177,6 +197,19 @@ class NavigationEnv(IsaacEnv):
                         obstacle_height_range=[1.0, 1.5, 2.0, 4.0, 6.0],
                         obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
                         platform_width=0.0,
+                        # Pre-sample valid interior free-space patches so interior_safe spawn mode
+                        # can sample from obstacle-free empty ground without doing expensive mesh
+                        # collision queries inside every _reset_idx call.
+                        flat_patch_sampling={
+                            "init_pos": FlatPatchSamplingCfg(
+                                num_patches=self.interior_spawn_num_patches,
+                                patch_radius=self.interior_spawn_patch_radius,
+                                x_range=(-self.map_range[0] + 1.0, self.map_range[0] - 1.0),
+                                y_range=(-self.map_range[1] + 1.0, self.map_range[1] - 1.0),
+                                z_range=(-0.05, 0.15),
+                                max_height_diff=self.interior_spawn_max_height_diff,
+                            ),
+                        },
                     ),
                 },
             ),
@@ -185,7 +218,7 @@ class NavigationEnv(IsaacEnv):
             collision_group=-1,
             debug_vis=True,
         )
-        terrain_importer = TerrainImporter(terrain_cfg)
+        self.terrain_importer = TerrainImporter(terrain_cfg)
 
         if (self.cfg.env_dyn.num_obstacles == 0):
             return
@@ -427,14 +460,18 @@ class NavigationEnv(IsaacEnv):
         if (self.training):
             # decide which side
             masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
-            shifts = torch.tensor([[0., 24., 0.], [0., -24., 0.], [24., 0., 0.], [-24., 0., 0.]], dtype=torch.float, device=self.device)
+            edge_x = self.spawn_target_edge_x
+            edge_y = self.spawn_target_edge_y
+            shifts = torch.tensor([[0., edge_y, 0.], [0., -edge_y, 0.], [edge_x, 0., 0.], [-edge_x, 0., 0.]], dtype=torch.float, device=self.device)
             mask_indices = np.random.randint(0, masks.size(0), size=env_ids.size(0))
             selected_masks = masks[mask_indices].unsqueeze(1)
             selected_shifts = shifts[mask_indices].unsqueeze(1)
 
 
             # generate random positions
-            target_pos = 48. * torch.rand(env_ids.size(0), 1, 3, dtype=torch.float, device=self.device) + (-24.)
+            target_pos = torch.zeros(env_ids.size(0), 1, 3, dtype=torch.float, device=self.device)
+            target_pos[:, 0, 0] = (2.0 * edge_x) * torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) - edge_x
+            target_pos[:, 0, 1] = (2.0 * edge_y) * torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) - edge_y
             heights = 0.5 + torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) * (2.5 - 0.5)
             target_pos[:, 0, 2] = heights# height
             target_pos = target_pos * selected_masks + selected_shifts
@@ -447,25 +484,56 @@ class NavigationEnv(IsaacEnv):
             # self.target_pos[:, 0, 2] = 2.    
         else:
             self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
-            self.target_pos[:, 0, 1] = -24.
+            self.target_pos[:, 0, 1] = -self.spawn_target_edge_y
             self.target_pos[:, 0, 2] = 2.            
+
+    def _sample_safe_interior_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Sample interior spawn positions from precomputed valid flat patches.
+
+        Orbit's flat-patch sampler already performs terrain-wide rejection sampling against
+        the generated obstacle mesh. We reuse that valid patch bank here instead of doing
+        expensive mesh collision queries inside every reset.
+        """
+        valid_patches = getattr(self.terrain_importer, 'flat_patches', {}).get("init_pos", None)
+        if valid_patches is None:
+            raise RuntimeError(
+                "env.spawn_mode='interior_safe' requires terrain flat patches under 'init_pos'. "
+                "Check TerrainGeneratorCfg.flat_patch_sampling in env.py."
+            )
+
+        flat_positions = valid_patches.reshape(-1, 3)
+        sample_ids = torch.randint(0, flat_positions.shape[0], (env_ids.size(0),), device=self.device)
+        pos = flat_positions[sample_ids].unsqueeze(1).clone()  # (B, 1, 3)
+        heights = 0.5 + torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) * (2.5 - 0.5)
+        pos[:, 0, 2] = heights
+        return pos
 
 
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
         self.reset_target(env_ids)
         if (self.training):
-            masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
-            shifts = torch.tensor([[0., 24., 0.], [0., -24., 0.], [24., 0., 0.], [-24., 0., 0.]], dtype=torch.float, device=self.device)
-            mask_indices = np.random.randint(0, masks.size(0), size=env_ids.size(0))
-            selected_masks = masks[mask_indices].unsqueeze(1)
-            selected_shifts = shifts[mask_indices].unsqueeze(1)
+            if self.spawn_mode == "edge":
+                masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
+                edge_x = self.spawn_target_edge_x
+                edge_y = self.spawn_target_edge_y
+                shifts = torch.tensor([[0., edge_y, 0.], [0., -edge_y, 0.], [edge_x, 0., 0.], [-edge_x, 0., 0.]], dtype=torch.float, device=self.device)
+                mask_indices = np.random.randint(0, masks.size(0), size=env_ids.size(0))
+                selected_masks = masks[mask_indices].unsqueeze(1)
+                selected_shifts = shifts[mask_indices].unsqueeze(1)
 
-            # generate random positions
-            pos = 48. * torch.rand(env_ids.size(0), 1, 3, dtype=torch.float, device=self.device) + (-24.)
-            heights = 0.5 + torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) * (2.5 - 0.5)
-            pos[:, 0, 2] = heights# height
-            pos = pos * selected_masks + selected_shifts
+                # generate random positions on the four map edges
+                pos = torch.zeros(env_ids.size(0), 1, 3, dtype=torch.float, device=self.device)
+                pos[:, 0, 0] = (2.0 * edge_x) * torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) - edge_x
+                pos[:, 0, 1] = (2.0 * edge_y) * torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) - edge_y
+                heights = 0.5 + torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) * (2.5 - 0.5)
+                pos[:, 0, 2] = heights
+                pos = pos * selected_masks + selected_shifts
+            elif self.spawn_mode == "interior_safe":
+                # Sample from obstacle-free interior empty space.
+                pos = self._sample_safe_interior_positions(env_ids)
+            else:
+                raise ValueError(f"Unknown env.spawn_mode='{self.spawn_mode}'. Expected 'edge' or 'interior_safe'.")
             
             # pos = torch.zeros(len(env_ids), 1, 3, device=self.device)
             # pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
@@ -474,7 +542,7 @@ class NavigationEnv(IsaacEnv):
         else:
             pos = torch.zeros(len(env_ids), 1, 3, device=self.device)
             pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
-            pos[:, 0, 1] = 24.
+            pos[:, 0, 1] = self.spawn_target_edge_y
             pos[:, 0, 2] = 2.
         
         # Coordinate change: after reset, the drone's target direction should be changed
@@ -776,6 +844,12 @@ class NavigationEnv(IsaacEnv):
         reach_goal = (distance_for_reward < 1.0)         # (B, 1) bool
         reach_goal_bonus = reach_goal.float() * 500.0    # fires once, episode resets immediately
 
+        # i. Horizontal out-of-bounds — must be computed before reward sum below.
+        out_of_bounds_xy = (
+            (self.drone.pos[..., 0].abs() > self.terrain_half_extent_x)
+            | (self.drone.pos[..., 1].abs() > self.terrain_half_extent_y)
+        )  # (B, 1) bool
+
         # ==== Final reward ====
         # reward_progress   CORE bidirectional: ±200 × Δd ≈ ±8 / step
         # reward_vel ×10    velocity toward goal: ±20
@@ -809,16 +883,16 @@ class NavigationEnv(IsaacEnv):
         # Terminate Conditions
         # reach_goal → terminated so: (a) episode resets giving diverse new start points,
         #   (b) reach_goal_bonus is truly one-time, (c) value estimates stay bounded.
-        below_bound = self.drone.pos[..., 2] < 0.2
-        above_bound = self.drone.pos[..., 2] > 4.
-        # Horizontal out-of-bounds: terminate and apply large penalty when drone leaves
-        # the ±27 m map area (3 m buffer past the ±24 m spawn/goal boundary).
-        # Without this, the drone can wander indefinitely with no consequence.
-        out_of_bounds_xy = (
-            (self.drone.pos[..., 0].abs() > 27.0) | (self.drone.pos[..., 1].abs() > 27.0)
-        )  # (B, 1) bool
+        below_bound = self.drone.pos[..., 2] < self.z_terminate_min
+        above_bound = self.drone.pos[..., 2] > self.z_terminate_max
+        # out_of_bounds_xy already computed above (before reward sum)
         self.terminated = below_bound | above_bound | collision | reach_goal | out_of_bounds_xy
-        self.truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1) # progress buf is to track the step number
+        # progress_buf is incremented by isaac_env._step() BEFORE _compute_reward_and_done() is
+        # called, so at step N the counter already reads N.  The condition >= max_episode_length
+        # correctly fires on the last step (step 1000 when max_episode_length=1000).
+        # truncated will appear as 0 when every episode ends via terminated (collision / goal)
+        # before reaching the time limit — that is expected and correct behaviour.
+        self.truncated = self.terminated
 
         # update previous velocity for smoothness calculation in the next ieteration
         self.prev_drone_vel_w = self.drone.vel_w[..., :3].clone()
