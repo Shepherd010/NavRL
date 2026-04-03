@@ -782,6 +782,7 @@ class NavigationEnv(IsaacEnv):
         # approach_bonus    50/(d+1): dense potential, 1–50
         # reach_goal_bonus  500 terminal success (one-time)
         # collision  ×−200  severe penalty (episode-ending)
+        # out_of_bounds_xy  −200 horizontal map-exit penalty (episode-ending)
         # penalty_smooth ×−2  jerk regularisation
         # penalty_height ×−20 quadratic OOB
         self.reward = (
@@ -790,6 +791,7 @@ class NavigationEnv(IsaacEnv):
             + approach_bonus                    # dense distance shaping: 1–50
             + reach_goal_bonus                  # terminal success: 500
             - collision.float() * 200.0         # collision: −200
+            - out_of_bounds_xy.float() * 200.0  # horizontal boundary exit: −200
             - penalty_smooth * 2.0              # jerk regularisation
             - penalty_height * 20.0             # height OOB constraint
         )
@@ -809,7 +811,13 @@ class NavigationEnv(IsaacEnv):
         #   (b) reach_goal_bonus is truly one-time, (c) value estimates stay bounded.
         below_bound = self.drone.pos[..., 2] < 0.2
         above_bound = self.drone.pos[..., 2] > 4.
-        self.terminated = below_bound | above_bound | collision | reach_goal
+        # Horizontal out-of-bounds: terminate and apply large penalty when drone leaves
+        # the ±27 m map area (3 m buffer past the ±24 m spawn/goal boundary).
+        # Without this, the drone can wander indefinitely with no consequence.
+        out_of_bounds_xy = (
+            (self.drone.pos[..., 0].abs() > 27.0) | (self.drone.pos[..., 1].abs() > 27.0)
+        )  # (B, 1) bool
+        self.terminated = below_bound | above_bound | collision | reach_goal | out_of_bounds_xy
         self.truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(-1) # progress buf is to track the step number
 
         # update previous velocity for smoothness calculation in the next ieteration

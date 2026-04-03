@@ -101,9 +101,46 @@ class TopoExtractor:
             full_node_mask[empty_env, 1]  = True
             # clearances stays 0 for virtual node (already zero-padded)
 
+        # ---------- Goal-direction waypoint — always present (last candidate slot) ----------
+        # Regardless of Voronoi nodes found, always overwrite the LAST candidate slot with a
+        # waypoint in the goal direction.  This guarantees the policy always has a direct
+        # "fly toward goal" option to learn from during exploration, which is critical in
+        # early training when policy weights are random and nodes may be clustered sideways.
+        # The QP safety shield will deflect the resulting velocity if the path is blocked,
+        # so injecting this node does NOT bypass obstacle avoidance.
+        #
+        # CRITICAL: look_ahead MUST be < max_edge_length (2.0 m) so that _build_edges
+        # creates a real edge ego→goal_wp.  Without an edge the sparse attention layer
+        # cannot route ego information to/from goal_wp, making the node effectively
+        # invisible → policy can never learn to select it reliably.
+        if target_pos is not None:
+            tgt_dir    = target_pos - ego_pos                              # (B, 3)
+            tgt_dist   = tgt_dir.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (B, 1)
+            tgt_dir_n  = tgt_dir / tgt_dist                                # unit (B, 3)
+            # Look-ahead: 1.8 m (just under max_edge_length=2.0 m to guarantee an edge),
+            # or the actual goal distance when closer than 1.8 m.
+            look_ahead = tgt_dist.squeeze(-1).clamp(max=1.8)              # (B,)
+            goal_wp    = ego_pos.clone()
+            goal_wp[:, :2] += tgt_dir_n[:, :2] * look_ahead.unsqueeze(-1)
+            goal_wp[:, 2]   = ego_pos[:, 2]     # keep ego height
+            node_positions[:, -1] = goal_wp     # last slot → always reachable as action N-1
+            full_node_mask[:, -1] = True
+
         # ---------- 4. Edges ----------
         edges, edge_lengths = self._build_edges(node_positions, full_node_mask)
         # edges: (B, N+1, N+1) bool
+
+        # Force edges between ego (index 0) and the goal waypoint (index -1) so
+        # that sparse attention can propagate ego context to goal_wp even when
+        # _build_edges would otherwise miss it (e.g. KNN of 5 already taken by
+        # closer Voronoi nodes).  Symmetrized: both directions added.
+        if target_pos is not None:
+            edges[:, 0, -1] = True
+            edges[:, -1, 0] = True
+            # Update edge_lengths for the newly forced edges
+            d_ego_goalwp = (node_positions[:, -1] - node_positions[:, 0]).norm(dim=-1)  # (B,)
+            edge_lengths[:, 0, -1] = d_ego_goalwp
+            edge_lengths[:, -1, 0] = d_ego_goalwp
 
         # ---------- 5. Node features ----------
         node_features = self._encode_node_features(
@@ -261,15 +298,18 @@ class TopoExtractor:
 
         # -- Goal-direction bias: reward nodes that lie along the path to the goal.
         # Uses ego-local XY (pool_xy is already relative to ego).
-        # Weight: 0.3 * goal_proj_norm is small enough that safety/clearance still
-        # dominates, but provides a tiebreak between equi-clearance corridors.
+        # Weight 1.5 is scaled relative to lidar_range (10 m) so that a node
+        # directly ahead scores +1.5 m and directly behind scores −1.5 m.
+        # This is large enough to meaningfully break ties between similarly-clear
+        # Voronoi corridors while still being overpowered by a 2 m clearance gap
+        # (i.e., safety dominates, but goal direction provides a real tiebreak).
         if ego_pos is not None and target_pos is not None:
             goal_xy   = target_pos[:, :2] - ego_pos[:, :2]        # (B, 2) local goal dir
             goal_n    = F.normalize(goal_xy, dim=-1)               # (B, 2) unit
             # projection of each candidate in ego-local XY onto goal direction
             proj      = (pool_xy * goal_n.unsqueeze(1)).sum(-1)    # (B, K) ∈ [-R, +R] m
             proj_n    = proj / float(self.lidar_range)             # (B, K) ∈ [-1, +1]
-            goal_bonus = 0.3 * proj_n * pool_valid.float()         # only valid candidates
+            goal_bonus = 1.5 * proj_n * pool_valid.float()         # ±1.5 m; only valid candidates
             pool_score = pool_score + goal_bonus
 
         # -- Vectorized greedy NMS over the pool --
@@ -433,21 +473,32 @@ class TopoExtractor:
         # Valid flag (1)
         valid_feat = node_mask.float().unsqueeze(-1)  # (B, N+1, 1)
 
-        # Concatenate: 3+3+1+1+1+3+3+1+1 = 17... need 18
-        # Add: node clearance normalised by lidar_range (1 more distinct feature)
+        # Normalise spatial features to O(1) scale so the initial linear projection
+        # doesn't need to learn large weight downcaling.
+        # lidar_range = 10m covers all within-graph distances; target can be up to 48m
+        # so we use a wider context_range = 3× lidar_range for target-relative features.
+        context_range   = float(self.lidar_range)       # 10 m  — for ego-relative
+        global_range    = 48.0                           # map half-extent — for target-relative
+        rel_ego_n  = rel_ego  / context_range           # (B, N+1, 3) ∈ [-1, +1] within lidar
+        rel_tgt_n  = rel_tgt  / global_range            # (B, N+1, 3) ∈ [-1, +1] across map
+        dist_ego_n = dist_ego / context_range           # (B, N+1, 1) ∈ [0, ?]; >1 outside lidar
+        dist_tgt_n = dist_tgt / global_range            # (B, N+1, 1) ∈ [0, 1] across map
+        vel_feat_n = vel_feat / float(self.lidar_range) # (B, N+1, 3) ~O(1) at v_max=5 m/s
+
+        # Normalised clearance
         clr_norm = (clr_all / self.lidar_range).clamp(0, 1)  # (B, N+1, 1)
 
         features = torch.cat([
-            rel_ego,       # 3
-            rel_tgt,       # 3
-            clr_all,       # 1
-            clr_norm,      # 1
-            dist_ego,      # 1
-            dist_tgt,      # 1
-            dir_tgt,       # 3
-            vel_feat,      # 3
-            ego_flag,      # 1
-            valid_feat,    # 1
+            rel_ego_n,     # 3  — ego-relative position, normalised
+            rel_tgt_n,     # 3  — target-relative position, normalised
+            clr_all,       # 1  — raw clearance (m)
+            clr_norm,      # 1  — clearance / lidar_range ∈ [0,1]
+            dist_ego_n,    # 1  — distance to ego, normalised
+            dist_tgt_n,    # 1  — distance to target, normalised (progress signal)
+            dir_tgt,       # 3  — unit direction to target (already O(1))
+            vel_feat_n,    # 3  — ego velocity, normalised
+            ego_flag,      # 1  — 1 for ego node, 0 otherwise
+            valid_feat,    # 1  — 1 for valid node, 0 for padding
         ], dim=-1)  # (B, N+1, 18)
 
         # Zero out padded nodes
