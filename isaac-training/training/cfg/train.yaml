@@ -10,6 +10,8 @@ headless: True
 mode: graph_ppo  # ppo | graph_ppo
 device: "cuda:0"
 seed: 0
+resume_checkpoint: "/home/lixinyang/NavRL/isaac-training/training/wandb/run-20260404_130433-4rjqifjc/files/checkpoint_2600.pt"
+resume_strict: true
 
 # Total Training Length
 max_frame_num: 12e8 # max frame 

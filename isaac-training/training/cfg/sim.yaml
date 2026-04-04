@@ -18,9 +18,10 @@ sim:
   # GPU buffers
   gpu_max_rigid_contact_count: 524288
   gpu_max_rigid_patch_count: 163840 # 33554432
-  gpu_found_lost_pairs_capacity: 4194304
+  gpu_found_lost_pairs_capacity: 8388608
   gpu_found_lost_aggregate_pairs_capacity: 33554432
-  gpu_total_aggregate_pairs_capacity: 4194304
+  # Must be above runtime demand (~4,195,690 at 4096 envs with obstacles).
+  gpu_total_aggregate_pairs_capacity: 8388608
   gpu_max_soft_body_contacts: 1048576
   gpu_max_particle_contacts: 1048576
   gpu_heap_capacity: 67108864

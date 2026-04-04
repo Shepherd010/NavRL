@@ -34,6 +34,13 @@ class PPO(TensorDictModuleBase):
         self.teacher_distill_min_weight = 0.0
         self.teacher_distill_warmup_steps = 0
         self.teacher_distill_decay_steps = 0
+        self.ppo_prior_enabled = False
+        self.ppo_prior_policy = None
+        self.ppo_prior_weight = 0.0
+        self.ppo_prior_min_weight = 0.0
+        self.ppo_prior_warmup_steps = 0
+        self.ppo_prior_decay_steps = 0
+        self.ppo_prior_temperature = 1.0
         self._graph_update_steps = 0
 
         # Detect graph_ppo mode from observation spec
@@ -192,6 +199,41 @@ class PPO(TensorDictModuleBase):
         self.teacher_distill_enabled = False
         self.teacher_policy = None
 
+    def enable_ppo_prior(self, prior_policy, prior_cfg):
+        """Attach a frozen CNN-PPO prior to warm-start Graph-PPO action selection."""
+        from omegaconf import OmegaConf, DictConfig
+        self.ppo_prior_policy = prior_policy
+        self.ppo_prior_enabled = True
+        _get = (lambda c, k, d: OmegaConf.select(c, k, default=d)) if isinstance(prior_cfg, DictConfig) \
+               else (lambda c, k, d: getattr(c, k, d))
+        self.ppo_prior_weight = float(_get(prior_cfg, 'weight', 1.0))
+        self.ppo_prior_min_weight = float(_get(prior_cfg, 'min_weight', 0.0))
+        self.ppo_prior_warmup_steps = int(_get(prior_cfg, 'warmup_steps', 0))
+        self.ppo_prior_decay_steps = int(_get(prior_cfg, 'decay_steps', 0))
+        self.ppo_prior_temperature = float(_get(prior_cfg, 'temperature', 1.0))
+
+    def disable_ppo_prior(self):
+        self.ppo_prior_enabled = False
+        self.ppo_prior_policy = None
+
+    def _ppo_prior_weight_now(self):
+        if not self.ppo_prior_enabled:
+            return 0.0
+
+        base_w = self.ppo_prior_weight
+        min_w = self.ppo_prior_min_weight
+        step = self._graph_update_steps
+        warmup = self.ppo_prior_warmup_steps
+        decay = self.ppo_prior_decay_steps
+
+        if step < warmup:
+            return base_w
+        if decay <= 0:
+            return min_w
+
+        p = min(1.0, float(step - warmup) / float(decay))
+        return base_w + (min_w - base_w) * p
+
     def _teacher_distill_weight_now(self):
         if not self.teacher_distill_enabled:
             return 0.0
@@ -211,15 +253,15 @@ class PPO(TensorDictModuleBase):
         return base_w + (min_w - base_w) * p
 
     @torch.no_grad()
-    def _teacher_velocity_from_obs(self, tensordict):
-        """Run frozen CNN teacher on current obs and return world-frame velocity (B, 3).
+    def _cnn_velocity_from_obs(self, cnn_policy, tensordict):
+        """Run frozen CNN PPO policy on current obs and return world-frame velocity (B, 3).
 
         Uses the deterministic Beta-distribution mean as action (alpha/(alpha+beta)),
         which is identical to the _forward_ppo path minus the stochastic sample.
         Keeps shapes consistent with how _forward_ppo maps action_normalized → world vel.
         """
-        if self.teacher_policy is None:
-            raise RuntimeError("Teacher distillation is enabled but teacher_policy is None")
+        if cnn_policy is None:
+            raise RuntimeError("CNN prior/teacher policy is None")
 
         # Build a minimal tensordict with only the CNN-PPO obs keys.
         # batch_size must match the minibatch (first dim of tensordict).
@@ -236,7 +278,7 @@ class PPO(TensorDictModuleBase):
         }, batch_size=[B], device=self.device)
 
         # Run feature extractor (writes "_feature" into td_teacher).
-        self.teacher_policy.feature_extractor(td_teacher)
+        cnn_policy.feature_extractor(td_teacher)
 
         # Run the BetaActor head directly to get alpha/beta without TorchRL sampling.
         # teacher.actor is a ProbabilisticActor wrapping TensorDictModule(BetaActor).
@@ -244,7 +286,7 @@ class PPO(TensorDictModuleBase):
         # Access the inner TensorDictModule (first element in the sequential) and call it.
         # actor.module is nn.ModuleList([TensorDictModule(BetaActor), ...]).
         # Index [0] is the TensorDictModule that reads "_feature" and writes alpha/beta.
-        self.teacher_policy.actor.module[0](td_teacher)     # writes alpha, beta → td_teacher
+        cnn_policy.actor.module[0](td_teacher)     # writes alpha, beta → td_teacher
 
         alpha = td_teacher["alpha"]   # (B, action_dim) or (B, 1, action_dim)
         beta  = td_teacher["beta"]
@@ -254,7 +296,7 @@ class PPO(TensorDictModuleBase):
         action_norm = alpha / (alpha + beta + 1e-6)          # (B, action_dim) or (B, 1, action_dim)
 
         # Map [0,1] → [-limit, +limit], same formula as _forward_ppo.
-        limit = self.teacher_policy.cfg.actor.action_limit
+        limit = cnn_policy.cfg.actor.action_limit
         action_local = (2.0 * action_norm * limit) - limit   # (B, ..., 3)
 
         # vec_to_world expects (B, 3) or (B, 1, 3); direction is (B, 1, 3).
@@ -265,6 +307,49 @@ class PPO(TensorDictModuleBase):
         if action_world.dim() == 3:
             action_world = action_world.squeeze(1)            # (B, 3)
         return action_world
+
+    @torch.no_grad()
+    def _teacher_velocity_from_obs(self, tensordict):
+        if self.teacher_policy is None:
+            raise RuntimeError("Teacher distillation is enabled but teacher_policy is None")
+        return self._cnn_velocity_from_obs(self.teacher_policy, tensordict)
+
+    def _candidate_node_velocities(self, node_positions: torch.Tensor) -> torch.Tensor:
+        """Map graph candidate nodes to world-frame target velocities. Returns (B, N, 3)."""
+        ego_pos = node_positions[:, :1, :]               # (B, 1, 3)
+        cand_pos = node_positions[:, 1:, :]              # (B, N, 3)
+        dir_vec = cand_pos - ego_pos                     # (B, N, 3)
+        node_dist = dir_vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        dt_low = 1.0 / float(getattr(self.topo_cfg, 'low_freq', 10.0))
+        speed = torch.minimum(
+            torch.full_like(node_dist, self.v_target),
+            node_dist / dt_low,
+        )
+        cand_vel = (dir_vec / node_dist) * speed
+        cand_vel = cand_vel.clone()
+        cand_vel[..., 2] = 0.0
+        return cand_vel
+
+    def _apply_ppo_prior(self, probs, node_positions, node_mask, tensordict):
+        """Blend graph action distribution with PPO prior projected onto graph nodes."""
+        prior_weight = self._ppo_prior_weight_now()
+        if (not self.ppo_prior_enabled) or self.ppo_prior_policy is None or prior_weight <= 0.0:
+            return probs, 0.0
+
+        with torch.no_grad():
+            prior_vel = self._cnn_velocity_from_obs(self.ppo_prior_policy, tensordict).to(probs.dtype)
+
+        cand_vel = self._candidate_node_velocities(node_positions).to(probs.dtype)
+        cand_mask = node_mask[:, 1:].bool()
+        temp = max(float(self.ppo_prior_temperature), 1e-6)
+        sq_err = ((cand_vel - prior_vel.unsqueeze(1)) ** 2).sum(dim=-1)
+        prior_logits = -sq_err / temp
+        prior_logits = prior_logits.masked_fill(~cand_mask, -1e9)
+        prior_probs = F.softmax(prior_logits, dim=-1)
+
+        probs = (1.0 - prior_weight) * probs + prior_weight * prior_probs
+        probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        return probs, prior_weight
 
     # ------------------------------------------------------------------
     # Forward
@@ -312,6 +397,7 @@ class PPO(TensorDictModuleBase):
         # Upcast to FP32 before Categorical / arithmetic (stability)
         probs = probs.float()
         h     = h.float()
+        probs, ppo_prior_weight = self._apply_ppo_prior(probs, node_positions, node_mask, tensordict)
 
         # Sample action from Categorical distribution
         dist       = Categorical(probs=probs)
@@ -322,21 +408,8 @@ class PPO(TensorDictModuleBase):
         N_total   = node_positions.shape[1]
         real_idx  = (action_idx + 1).clamp(max=N_total - 1)     # (B,) safety clamp
         cand_pos  = node_positions[torch.arange(node_positions.shape[0], device=self.device), real_idx]  # (B, 3)
-        ego_pos   = node_positions[:, 0, :]                      # (B, 3)
-        dir_vec   = cand_pos - ego_pos                           # (B, 3)
-        # doc/06 §4.2.2: speed = min(v_target, dist/dt_low) so drone decelerates near node
-        _dt_low   = 1.0 / float(getattr(self.topo_cfg, 'low_freq', 10.0))  # high-level period
-        _dist     = dir_vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (B, 1)
-        _speed    = torch.minimum(
-            torch.full_like(_dist, self.v_target),
-            _dist / _dt_low,
-        )
-        vel_w     = (dir_vec / _dist) * _speed                   # (B, 3)
-        # Nodes are projected to ego Z — the Z component of dir_vec is always ~0
-        # but floating-point noise can accumulate; zero it explicitly so
-        # LeePositionController never receives a spurious climb/dive command.
-        vel_w = vel_w.clone()
-        vel_w[:, 2] = 0.0
+        cand_vel_all = self._candidate_node_velocities(node_positions)
+        vel_w = cand_vel_all[torch.arange(node_positions.shape[0], device=self.device), action_idx]
 
         # Critic value from ego embedding
         h_ego     = h[:, 0, :]                                   # (B, hidden_dim)
@@ -346,6 +419,7 @@ class PPO(TensorDictModuleBase):
         tensordict["graph_action"]    = action_idx   # (B,) discrete node index – used in _update
         tensordict["sample_log_prob"] = log_prob      # (B,)
         tensordict["state_value"]     = value         # (B, 1)
+        tensordict["_ppo_prior_weight"] = torch.full((node_positions.shape[0],), ppo_prior_weight, device=self.device)
         # Cache raw velocity so _pre_sim_step_graph can read it AFTER VelController runs.
         # VelController._inv_call overwrites ("agents","action") with motor thrusts before
         # _pre_sim_step is called, so reading from ("agents","action") inside _pre_sim_step
@@ -477,6 +551,7 @@ class PPO(TensorDictModuleBase):
         # Upcast to FP32 before loss computation (Categorical, log_prob, PPO ratio)
         probs = probs.float()
         h     = h.float()
+        probs, ppo_prior_weight = self._apply_ppo_prior(probs, node_positions, node_mask, tensordict)
         dist           = Categorical(probs=probs)
         log_probs      = dist.log_prob(tensordict["graph_action"])   # (B,)
         action_entropy = dist.entropy()                             # (B,)
@@ -508,18 +583,7 @@ class PPO(TensorDictModuleBase):
         if self.teacher_distill_enabled and self.teacher_policy is not None:
             # Student expected velocity from graph action probabilities.
             # Candidate nodes exclude ego node at index 0.
-            ego_pos = node_positions[:, :1, :]               # (B, 1, 3)
-            cand_pos = node_positions[:, 1:, :]              # (B, N, 3)
-            dir_vec = cand_pos - ego_pos                     # (B, N, 3)
-            _node_dist = dir_vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            dt_low = 1.0 / float(getattr(self.topo_cfg, 'low_freq', 10.0))
-            speed = torch.minimum(
-                torch.full_like(_node_dist, self.v_target),
-                _node_dist / dt_low,
-            )
-            cand_vel = (dir_vec / _node_dist) * speed        # (B, N, 3)
-            cand_vel = cand_vel.clone()
-            cand_vel[..., 2] = 0.0
+            cand_vel = self._candidate_node_velocities(node_positions)
             v_student = (probs.unsqueeze(-1) * cand_vel).sum(dim=1)  # (B, 3)
 
             # Frozen teacher target velocity from the same minibatch observations.
@@ -560,6 +624,7 @@ class PPO(TensorDictModuleBase):
             "explained_var":   explained_var,
             "distill_loss":    distill_loss,
             "distill_weight":  torch.tensor(distill_weight, device=self.device),
+            "ppo_prior_weight": torch.tensor(ppo_prior_weight, device=self.device),
         }, [])
 
     @torch.no_grad()

@@ -45,6 +45,16 @@ topo:
   # ----- Training (graph_ppo mode) -----
   entropy_loss_coefficient: 0.02     # higher entropy → more exploration, avoids hovering fixed point
 
+  # ----- PPO -> Graph-PPO transfer (plugin-style, optional) -----
+  transfer_from_ppo:
+    enabled: false
+    checkpoint: "quick-demos/ckpts/navrl_checkpoint.pt"
+    weight: 1.0                 # start by following PPO prior-projected node distribution
+    min_weight: 0.0             # decay to pure Graph-PPO
+    warmup_steps: 0
+    decay_steps: 100000
+    temperature: 1.0            # lower = harder nearest-node projection, higher = softer prior
+
   # ----- HierarchicalController -----
   high_freq: 62.5                # simulation frequency (Hz)
   low_freq: 10.0                 # planning frequency (Hz)

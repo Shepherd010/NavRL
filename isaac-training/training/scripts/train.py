@@ -17,6 +17,33 @@ import viz as viz_lib  # visualization helpers (V1-V4)
 from curriculum_manager import CurriculumManager
 
 
+def _resolve_ckpt_path(raw_path: str | None) -> str | None:
+    """Resolve checkpoint path with cwd/repo-relative fallbacks."""
+    if raw_path is None:
+        return None
+    path = os.path.expandvars(os.path.expanduser(str(raw_path)))
+    if os.path.isabs(path):
+        return path if os.path.exists(path) else None
+
+    cwd_path = os.path.abspath(path)
+    if os.path.exists(cwd_path):
+        return cwd_path
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    repo_path = os.path.abspath(os.path.join(repo_root, path))
+    if os.path.exists(repo_path):
+        return repo_path
+    return None
+
+
+def _load_policy_state(policy: PPO, ckpt_path: str, device: str, strict: bool = True) -> None:
+    """Load checkpoint into policy; supports raw state_dict or wrapped dict with key 'policy'."""
+    state = torch.load(ckpt_path, map_location=device)
+    if isinstance(state, dict) and "policy" in state:
+        state = state["policy"]
+    policy.load_state_dict(state, strict=strict)
+
+
 
 
 FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cfg")
@@ -63,6 +90,42 @@ def main(cfg):
     policy = PPO(cfg.algo, transformed_env.observation_spec, transformed_env.action_spec, cfg.device,
                  topo_cfg=_topo_cfg)
 
+    # Optional policy resume checkpoint (same-architecture continuation).
+    resume_ckpt_raw = OmegaConf.select(cfg, 'resume_checkpoint', default=None)
+    if resume_ckpt_raw:
+        resume_ckpt = _resolve_ckpt_path(str(resume_ckpt_raw))
+        if resume_ckpt is None:
+            raise FileNotFoundError(f"resume_checkpoint not found: {resume_ckpt_raw}")
+        resume_strict = bool(OmegaConf.select(cfg, 'resume_strict', default=True))
+        _load_policy_state(policy, resume_ckpt, cfg.device, strict=resume_strict)
+        print(f"[NavRL]: resumed policy from checkpoint: {resume_ckpt} (strict={resume_strict})")
+
+    # Optional PPO -> Graph-PPO transfer plugin.
+    transfer_enabled = bool(OmegaConf.select(cfg, 'topo.transfer_from_ppo.enabled', default=False))
+    if transfer_enabled and OmegaConf.select(cfg, 'mode', default='ppo') == 'graph_ppo':
+        prior_policy = PPO(
+            cfg.algo,
+            transformed_env.observation_spec,
+            transformed_env.action_spec,
+            cfg.device,
+            topo_cfg=None,
+        )
+        prior_ckpt_raw = OmegaConf.select(cfg, 'topo.transfer_from_ppo.checkpoint', default=None)
+        if prior_ckpt_raw is None:
+            raise ValueError("topo.transfer_from_ppo.enabled=true but checkpoint is missing")
+        prior_ckpt = _resolve_ckpt_path(str(prior_ckpt_raw))
+        if prior_ckpt is None:
+            raise FileNotFoundError(
+                f"topo.transfer_from_ppo.checkpoint not found: {prior_ckpt_raw}. "
+                "Use absolute path or repo-relative path."
+            )
+        _load_policy_state(prior_policy, prior_ckpt, cfg.device, strict=True)
+        prior_policy.eval()
+        for p in prior_policy.parameters():
+            p.requires_grad = False
+        policy.enable_ppo_prior(prior_policy, cfg.topo.transfer_from_ppo)
+        print(f"[NavRL]: enabled PPO -> Graph-PPO transfer prior from checkpoint: {prior_ckpt}")
+
     # Optional frozen-teacher distillation module for graph_ppo.
     # Independent switch: disabled by default, no behavior change when off.
     distill_enabled = bool(OmegaConf.select(cfg, 'teacher_distill.enabled', default=False))
@@ -74,11 +137,16 @@ def main(cfg):
             cfg.device,
             topo_cfg=None,
         )
-        teacher_ckpt = OmegaConf.select(cfg, 'teacher_distill.checkpoint', default=None)
-        if teacher_ckpt is None:
+        teacher_ckpt_raw = OmegaConf.select(cfg, 'teacher_distill.checkpoint', default=None)
+        if teacher_ckpt_raw is None:
             raise ValueError("teacher_distill.enabled=true but teacher_distill.checkpoint is missing")
-        teacher_state = torch.load(teacher_ckpt, map_location=cfg.device)
-        teacher_policy.load_state_dict(teacher_state, strict=True)
+        teacher_ckpt = _resolve_ckpt_path(str(teacher_ckpt_raw))
+        if teacher_ckpt is None:
+            raise FileNotFoundError(
+                f"teacher_distill.checkpoint not found: {teacher_ckpt_raw}. "
+                "Use absolute path or repo-relative path."
+            )
+        _load_policy_state(teacher_policy, teacher_ckpt, cfg.device, strict=True)
         teacher_policy.eval()
         for p in teacher_policy.parameters():
             p.requires_grad = False
@@ -98,21 +166,27 @@ def main(cfg):
         # Teacher distillation per curriculum stage
         if curriculum_mgr.teacher_enabled_this_stage():
             teacher_cfg = curriculum_mgr.get_teacher_config()
-            teacher_ckpt = str(teacher_cfg.checkpoint)
-            teacher_policy = PPO(
-                cfg.algo,
-                transformed_env.observation_spec,
-                transformed_env.action_spec,
-                cfg.device,
-                topo_cfg=None,
-            )
-            teacher_state = torch.load(teacher_ckpt, map_location=cfg.device)
-            teacher_policy.load_state_dict(teacher_state, strict=True)
-            teacher_policy.eval()
-            for p in teacher_policy.parameters():
-                p.requires_grad = False
-            policy.enable_teacher_distill(teacher_policy, teacher_cfg)
-            print(f"[NavRL Curriculum]: enabled teacher distillation from {teacher_ckpt}")
+            teacher_ckpt_raw = str(teacher_cfg.checkpoint)
+            teacher_ckpt = _resolve_ckpt_path(teacher_ckpt_raw)
+            if teacher_ckpt is None:
+                print(
+                    f"[NavRL Curriculum]: teacher checkpoint not found ({teacher_ckpt_raw}); "
+                    "skip distillation for current stage."
+                )
+            else:
+                teacher_policy = PPO(
+                    cfg.algo,
+                    transformed_env.observation_spec,
+                    transformed_env.action_spec,
+                    cfg.device,
+                    topo_cfg=None,
+                )
+                _load_policy_state(teacher_policy, teacher_ckpt, cfg.device, strict=True)
+                teacher_policy.eval()
+                for p in teacher_policy.parameters():
+                    p.requires_grad = False
+                policy.enable_teacher_distill(teacher_policy, teacher_cfg)
+                print(f"[NavRL Curriculum]: enabled teacher distillation from {teacher_ckpt}")
         else:
             print(f"[NavRL Curriculum]: stage {curriculum_mgr.stage} — teacher distill disabled")
         print(f"[NavRL Curriculum]: starting at stage {curriculum_mgr.stage} "
@@ -198,16 +272,21 @@ def main(cfg):
                     # Toggle teacher distillation for new stage
                     if curriculum_mgr.teacher_enabled_this_stage() and not getattr(policy, 'teacher_policy', None):
                         teacher_cfg = curriculum_mgr.get_teacher_config()
-                        teacher_ckpt = str(teacher_cfg.checkpoint) if teacher_cfg else None
+                        teacher_ckpt_raw = str(teacher_cfg.checkpoint) if teacher_cfg else None
+                        teacher_ckpt = _resolve_ckpt_path(teacher_ckpt_raw) if teacher_ckpt_raw else None
                         if teacher_ckpt:
                             teacher_policy = PPO(cfg.algo, transformed_env.observation_spec,
                                                  transformed_env.action_spec, cfg.device, topo_cfg=None)
-                            teacher_state = torch.load(teacher_ckpt, map_location=cfg.device)
-                            teacher_policy.load_state_dict(teacher_state, strict=True)
+                            _load_policy_state(teacher_policy, teacher_ckpt, cfg.device, strict=True)
                             teacher_policy.eval()
                             for p in teacher_policy.parameters():
                                 p.requires_grad = False
                             policy.enable_teacher_distill(teacher_policy, teacher_cfg)
+                        elif teacher_ckpt_raw:
+                            print(
+                                f"[NavRL Curriculum]: teacher checkpoint not found ({teacher_ckpt_raw}); "
+                                "skip distillation after stage advance."
+                            )
                     elif not curriculum_mgr.teacher_enabled_this_stage() and hasattr(policy, 'disable_teacher_distill'):
                         policy.disable_teacher_distill()
                     print(f"[NavRL Curriculum]: advanced from stage {old_stage} → {curriculum_mgr.stage} "
