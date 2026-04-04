@@ -14,7 +14,7 @@ curriculum:
     max_frames: 5e6
     num_obstacles: 0          # static obstacles (overrides env.num_obstacles)
     dyn_obstacles: 0          # dynamic obstacles (overrides env_dyn.num_obstacles)
-    spawn_mode: center        # spawn near map centre
+    spawn_mode: edge          # spawn on map edges
     spawn_radius: 3.0         # metres around (0,0)
     target_mode: direction    # place target at random bearing + distance
     target_distance: [5, 10]  # [min, max] metres
@@ -43,7 +43,7 @@ curriculum:
     max_frames: 50e6
     num_obstacles: 350
     dyn_obstacles: 80
-    spawn_mode: interior_safe
+    spawn_mode: edge
     target_mode: point
     target_distance: [20, 48]
     max_episode_length: 1000

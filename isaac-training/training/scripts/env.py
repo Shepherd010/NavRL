@@ -221,11 +221,9 @@ class NavigationEnv(IsaacEnv):
             obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
             platform_width=0.0,
         )
-        # Always bake flat patches when curriculum is enabled (worst-case stage init).
-        # Stage 3 switches spawn_mode to "interior_safe" at runtime; if flat patches were
-        # not baked at startup the terrain importer has no valid patch bank and
-        # _sample_safe_interior_positions() raises RuntimeError.
-        need_flat_patches = (self.spawn_mode == "interior_safe") or self.curriculum_enabled
+        # Edge/center spawn should not pay interior flat-patch sampling cost.
+        # Only bake flat patches when the CURRENT spawn mode is interior_safe.
+        need_flat_patches = (self.spawn_mode == "interior_safe")
         patch_num = int(self.interior_spawn_num_patches)
         patch_radius = float(self.interior_spawn_patch_radius)
         patch_max_hdiff = float(self.interior_spawn_max_height_diff)
@@ -620,8 +618,19 @@ class NavigationEnv(IsaacEnv):
         if not self.curriculum_enabled:
             return
         sc = self.curriculum_manager.get_stage_config()
-        # Update spawn mode and spawn radius
-        self.spawn_mode = sc.get("spawn_mode", self.spawn_mode)
+        # Update spawn mode and spawn radius.
+        # If curriculum requests interior_safe but terrain has no flat patches,
+        # gracefully fall back to edge spawn instead of crashing training.
+        requested_spawn_mode = sc.get("spawn_mode", self.spawn_mode)
+        if requested_spawn_mode == "interior_safe":
+            valid_patches = getattr(self.terrain_importer, 'flat_patches', {}).get("init_pos", None)
+            if valid_patches is None:
+                print(
+                    "[Navigation Environment]: curriculum requested interior_safe but terrain "
+                    "has no flat patches; fallback to edge spawn."
+                )
+                requested_spawn_mode = "edge"
+        self.spawn_mode = requested_spawn_mode
         self._curriculum_spawn_radius = float(sc.get("spawn_radius", getattr(self, '_curriculum_spawn_radius', 3.0)))
         # Update max episode length
         new_max = sc.get("max_episode_length", None)
@@ -678,7 +687,29 @@ class NavigationEnv(IsaacEnv):
                 pos = pos * selected_masks + selected_shifts
             elif self.spawn_mode == "interior_safe":
                 # Sample from obstacle-free interior empty space.
-                pos = self._sample_safe_interior_positions(env_ids)
+                try:
+                    pos = self._sample_safe_interior_positions(env_ids)
+                except RuntimeError:
+                    # Safety net: if interior patches are unavailable, keep training alive
+                    # by falling back to edge spawn for this reset and future resets.
+                    print(
+                        "[Navigation Environment]: interior_safe reset fallback to edge "
+                        "(flat patches unavailable)."
+                    )
+                    self.spawn_mode = "edge"
+                    masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
+                    edge_x = self.spawn_target_edge_x
+                    edge_y = self.spawn_target_edge_y
+                    shifts = torch.tensor([[0., edge_y, 0.], [0., -edge_y, 0.], [edge_x, 0., 0.], [-edge_x, 0., 0.]], dtype=torch.float, device=self.device)
+                    mask_indices = np.random.randint(0, masks.size(0), size=env_ids.size(0))
+                    selected_masks = masks[mask_indices].unsqueeze(1)
+                    selected_shifts = shifts[mask_indices].unsqueeze(1)
+                    pos = torch.zeros(env_ids.size(0), 1, 3, dtype=torch.float, device=self.device)
+                    pos[:, 0, 0] = (2.0 * edge_x) * torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) - edge_x
+                    pos[:, 0, 1] = (2.0 * edge_y) * torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) - edge_y
+                    heights = 0.5 + torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) * (2.5 - 0.5)
+                    pos[:, 0, 2] = heights
+                    pos = pos * selected_masks + selected_shifts
             elif self.spawn_mode == "center":
                 # Curriculum Stage 1: spawn near map centre within a small radius.
                 radius = float(getattr(self, '_curriculum_spawn_radius', 3.0))

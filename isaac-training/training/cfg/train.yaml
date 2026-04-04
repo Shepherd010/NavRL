@@ -23,7 +23,7 @@ env:
   max_episode_length: 1000  # 2200→1000: 目标~30m, 2m/s需約4×150=600步; 短化提高episode多样性
   env_spacing: 8.0 
   num_obstacles: 350
-  spawn_mode: interior_safe  # edge | interior_safe
+  spawn_mode: edge  # edge | interior_safe
   interior_spawn_num_patches: 512
   interior_spawn_patch_radius: 0.3
   interior_spawn_max_height_diff: 0.30
