@@ -57,6 +57,16 @@ class NavigationEnv(IsaacEnv):
             and OmegaConf.select(cfg, 'mode', default='ppo') == 'graph_ppo'
         )
 
+        # curriculum_enabled must be set BEFORE super().__init__() because
+        # _design_scene() is called inside the parent __init__ and reads this flag
+        # to decide whether to bake flat_patch_sampling into the terrain.
+        _cur_cfg_pre = OmegaConf.select(cfg, 'curriculum', default=None)
+        self.curriculum_enabled = (
+            _cur_cfg_pre is not None
+            and bool(OmegaConf.select(_cur_cfg_pre, 'enabled', default=False))
+            and OmegaConf.select(cfg, 'mode', default='ppo') == 'ppo'
+        )
+
         super().__init__(cfg, cfg.headless)
         
         # Drone Initialization
@@ -100,12 +110,7 @@ class NavigationEnv(IsaacEnv):
         #    Curriculum plugin: if enabled (mode=ppo only), overrides preset per stage.
         #    graph_ppo uses the default full_navigation preset.
         from reward_shaping import RewardShaper
-        _cur_cfg = OmegaConf.select(cfg, 'curriculum', default=None)
-        self.curriculum_enabled = (
-            _cur_cfg is not None
-            and OmegaConf.select(_cur_cfg, 'enabled', default=False)
-            and OmegaConf.select(cfg, 'mode', default='ppo') == 'ppo'
-        )
+        _cur_cfg = _cur_cfg_pre  # already computed before super().__init__()
         self.curriculum_manager = None
         if self.curriculum_enabled:
             from curriculum_manager import CurriculumManager
