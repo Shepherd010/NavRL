@@ -189,6 +189,7 @@ def main(cfg):
                     "heading_accuracy": stats.get("train/stats.reward_heading", 0.0) / 5.0,
                 }
                 curriculum_mgr.record_metrics(curriculum_metrics)
+                curriculum_mgr.total_frames = collector._frames
                 old_stage = curriculum_mgr.stage
                 if curriculum_mgr.should_advance():
                     curriculum_mgr.advance()

@@ -216,7 +216,11 @@ class NavigationEnv(IsaacEnv):
             obstacle_height_probability=[0.1, 0.15, 0.20, 0.55],
             platform_width=0.0,
         )
-        if self.spawn_mode == "interior_safe":
+        # Always bake flat patches when curriculum is enabled (worst-case stage init).
+        # Stage 3 switches spawn_mode to "interior_safe" at runtime; if flat patches were
+        # not baked at startup the terrain importer has no valid patch bank and
+        # _sample_safe_interior_positions() raises RuntimeError.
+        if self.spawn_mode == "interior_safe" or self.curriculum_enabled:
             obstacle_cfg_kwargs["flat_patch_sampling"] = {
                 "init_pos": FlatPatchSamplingCfg(
                     num_patches=self.interior_spawn_num_patches,

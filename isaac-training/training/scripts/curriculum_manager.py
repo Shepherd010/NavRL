@@ -88,11 +88,30 @@ class CurriculumManager:
         return sum(recent) / len(recent)
 
     def should_advance(self) -> bool:
-        """Check if current stage metrics satisfy promotion thresholds."""
+        """Check if current stage metrics satisfy promotion thresholds.
+
+        Two paths to advance:
+        1. Metrics path: rolling-window averages exceed all stage thresholds.
+        2. Frame-budget path: total env frames since training start exceed
+           ``stage<N>.max_frames`` — acts as a safety net to prevent the policy
+           from being stuck in one stage if thresholds are too tight.
+        """
         if not self.auto_advance:
             return False
         if self.stage >= self.MAX_STAGE:
             return False
+
+        # --- Frame-budget fallback: force advance if max_frames exhausted ---
+        stage_cfg = OmegaConf.select(self.cfg, f"stage{self.stage}", default=None)
+        if stage_cfg is not None:
+            max_frames = float(stage_cfg.get("max_frames", float("inf")))
+            if self.total_frames >= max_frames:
+                print(
+                    f"[Curriculum] Stage {self.stage} max_frames={max_frames:.0f} reached "
+                    f"(total={self.total_frames}) — forcing advance."
+                )
+                return True
+
         if self._advance_cfg is None:
             return False
 
