@@ -4,10 +4,10 @@
 
 topo:
   # ----- TopoExtractor -----
-  max_nodes: 40                  # reduced for lower O(N^2) attention cost, total N+1 = 25
+  max_nodes: 40                  # candidate nodes; total graph nodes = max_nodes + 1 (ego) = 41
   node_feat_dim: 18
   edge_feat_dim: 8                # 3(rel_pos)+1(elen)+1(dyn_dist)+3(dir)
-  lidar_range: 10.0              # must match sensor.lidar_range in train.yaml
+  lidar_range: 4.0               # must match sensor.lidar_range in drone.yaml
   grid_size: 100                 # 2D distance field grid resolution (100x100 -> 0.1m/cell)
   safe_radius: 0.4               # minimum clearance (m) for a valid Voronoi node
   grad_threshold: 0.5            # gradient magnitude threshold for local maxima detection

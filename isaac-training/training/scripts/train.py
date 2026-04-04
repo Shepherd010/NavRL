@@ -14,6 +14,7 @@ from torchrl.envs.transforms import TransformedEnv, Compose
 from utils import evaluate
 from torchrl.envs.utils import ExplorationType
 import viz as viz_lib  # visualization helpers (V1-V4)
+from curriculum_manager import CurriculumManager
 
 
 
@@ -88,6 +89,34 @@ def main(cfg):
     # checkpoint = "/home/zhefan/catkin_ws/src/navigation_runner/scripts/ckpts/checkpoint_2500.pt"
     # checkpoint = "/home/xinmingh/RLDrones/navigation/scripts/nav-ros/navigation_runner/ckpts/checkpoint_36000.pt"
     # policy.load_state_dict(torch.load(checkpoint))
+
+    # ---- Curriculum Manager (plugin, only when curriculum.enabled=True & mode=ppo) ----
+    curriculum_enabled = bool(OmegaConf.select(cfg, 'curriculum.enabled', default=False))
+    curriculum_mgr: CurriculumManager | None = None
+    if curriculum_enabled and OmegaConf.select(cfg, 'mode', default='ppo') == 'ppo':
+        curriculum_mgr = CurriculumManager(cfg.curriculum)
+        # Teacher distillation per curriculum stage
+        if curriculum_mgr.teacher_enabled_this_stage():
+            teacher_cfg = curriculum_mgr.get_teacher_config()
+            teacher_ckpt = str(teacher_cfg.checkpoint)
+            teacher_policy = PPO(
+                cfg.algo,
+                transformed_env.observation_spec,
+                transformed_env.action_spec,
+                cfg.device,
+                topo_cfg=None,
+            )
+            teacher_state = torch.load(teacher_ckpt, map_location=cfg.device)
+            teacher_policy.load_state_dict(teacher_state, strict=True)
+            teacher_policy.eval()
+            for p in teacher_policy.parameters():
+                p.requires_grad = False
+            policy.enable_teacher_distill(teacher_policy, teacher_cfg)
+            print(f"[NavRL Curriculum]: enabled teacher distillation from {teacher_ckpt}")
+        else:
+            print(f"[NavRL Curriculum]: stage {curriculum_mgr.stage} — teacher distill disabled")
+        print(f"[NavRL Curriculum]: starting at stage {curriculum_mgr.stage} "
+              f"({curriculum_mgr.STAGE_KEYS[curriculum_mgr.stage]})")
     
     # Episode Stats Collector
     episode_stats_keys = [
@@ -147,6 +176,43 @@ def main(cfg):
             }
             info.update(stats)
 
+            # ---- Curriculum: feed metrics & check stage advance ----
+            if curriculum_mgr is not None:
+                # Build metrics dict matching CurriculumManager.should_advance() keys
+                curriculum_metrics = {
+                    "reach_goal": stats.get("train/stats.reach_goal", 0.0),
+                    "collision": stats.get("train/stats.collision", 0.0),
+                    "speed": stats.get("train/stats.speed", 0.0),
+                    "episode_len": stats.get("train/stats.episode_len", 0.0),
+                    # reward_heading is cos(vel,dir)×5; divide by 5 to get raw cosine
+                    # matching heading_accuracy threshold (e.g. 0.6 = 60° alignment)
+                    "heading_accuracy": stats.get("train/stats.reward_heading", 0.0) / 5.0,
+                }
+                curriculum_mgr.record_metrics(curriculum_metrics)
+                old_stage = curriculum_mgr.stage
+                if curriculum_mgr.should_advance():
+                    curriculum_mgr.advance()
+                    base_env = env.base_env if hasattr(env, 'base_env') else env
+                    base_env.apply_curriculum_stage()
+                    # Toggle teacher distillation for new stage
+                    if curriculum_mgr.teacher_enabled_this_stage() and not getattr(policy, 'teacher_policy', None):
+                        teacher_cfg = curriculum_mgr.get_teacher_config()
+                        teacher_ckpt = str(teacher_cfg.checkpoint) if teacher_cfg else None
+                        if teacher_ckpt:
+                            teacher_policy = PPO(cfg.algo, transformed_env.observation_spec,
+                                                 transformed_env.action_spec, cfg.device, topo_cfg=None)
+                            teacher_state = torch.load(teacher_ckpt, map_location=cfg.device)
+                            teacher_policy.load_state_dict(teacher_state, strict=True)
+                            teacher_policy.eval()
+                            for p in teacher_policy.parameters():
+                                p.requires_grad = False
+                            policy.enable_teacher_distill(teacher_policy, teacher_cfg)
+                    elif not curriculum_mgr.teacher_enabled_this_stage() and hasattr(policy, 'disable_teacher_distill'):
+                        policy.disable_teacher_distill()
+                    print(f"[NavRL Curriculum]: advanced from stage {old_stage} → {curriculum_mgr.stage} "
+                          f"({curriculum_mgr.STAGE_KEYS[curriculum_mgr.stage]})")
+                info["curriculum/stage"] = curriculum_mgr.stage
+
         # Evaluate policy and log info
         if i > 0 and i % cfg.eval_interval == 0:
             print("[NavRL]: start evaluating policy at training step: ", i)
@@ -183,12 +249,13 @@ def main(cfg):
                 try:
                     raw = data["next", "stats"]
                     _reward_key_map = {
-                        "reward_vel":       ("vel",          +1.0),
-                        "reward_progress":  ("progress",     +1.0),
-                        "penalty_smooth":   ("smooth (−)",   -1.0),
-                        "penalty_height":   ("height (−)",   -1.0),
-                        "collision":        ("collision (−)", -10.0),
-                        "qp_intervention":  ("QP interv.",   -1.0),
+                        "reward_progress":  ("progress",        +1.0),
+                        "reward_heading":   ("heading",          +1.0),
+                        "reward_speed":     ("speed",            +1.0),
+                        "penalty_smooth":   ("smooth (−)",       -1.0),
+                        "penalty_height":   ("height (−)",       -1.0),
+                        "collision":        ("collision (−)",    -10.0),
+                        "qp_intervention":  ("QP interv.",       -1.0),
                     }
                     _tmp = {}
                     for rk, (display, sign) in _reward_key_map.items():
@@ -260,11 +327,17 @@ def main(cfg):
         # Save Model
         if i % cfg.save_interval == 0:
             ckpt_path = os.path.join(run.dir, f"checkpoint_{i}.pt")
-            torch.save(policy.state_dict(), ckpt_path)
+            save_dict = policy.state_dict()
+            if curriculum_mgr is not None:
+                save_dict = {"policy": save_dict, "curriculum": curriculum_mgr.state_dict()}
+            torch.save(save_dict, ckpt_path)
             print("[NavRL]: model saved at training step: ", i)
 
     ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
-    torch.save(policy.state_dict(), ckpt_path)
+    save_dict = policy.state_dict()
+    if curriculum_mgr is not None:
+        save_dict = {"policy": save_dict, "curriculum": curriculum_mgr.state_dict()}
+    torch.save(save_dict, ckpt_path)
     wandb.finish()
     sim_app.close()
 

@@ -474,11 +474,11 @@ class TopoExtractor:
         valid_feat = node_mask.float().unsqueeze(-1)  # (B, N+1, 1)
 
         # Normalise spatial features to O(1) scale so the initial linear projection
-        # doesn't need to learn large weight downcaling.
-        # lidar_range = 10m covers all within-graph distances; target can be up to 48m
-        # so we use a wider context_range = 3× lidar_range for target-relative features.
-        context_range   = float(self.lidar_range)       # 10 m  — for ego-relative
-        global_range    = 48.0                           # map half-extent — for target-relative
+        # doesn't need to learn large weight downscaling.
+        # context_range = lidar_range covers all within-graph distances;
+        # global_range = max possible target distance (curriculum stage3 target_distance[1])
+        context_range   = float(self.lidar_range)       # for ego-relative
+        global_range    = 48.0                           # max target distance — for target-relative
         rel_ego_n  = rel_ego  / context_range           # (B, N+1, 3) ∈ [-1, +1] within lidar
         rel_tgt_n  = rel_tgt  / global_range            # (B, N+1, 3) ∈ [-1, +1] across map
         dist_ego_n = dist_ego / context_range           # (B, N+1, 1) ∈ [0, ?]; >1 outside lidar

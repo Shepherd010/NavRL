@@ -96,6 +96,43 @@ class NavigationEnv(IsaacEnv):
             self._last_tracking_error      = None   # (B,) set by _pre_sim_step_graph
         self.init_vels = torch.zeros_like(self.drone.get_velocities())
 
+        # ── Privilege-free RewardShaper — always active for ALL training modes.
+        #    Curriculum plugin: if enabled (mode=ppo only), overrides preset per stage.
+        #    graph_ppo uses the default full_navigation preset.
+        from reward_shaping import RewardShaper
+        _cur_cfg = OmegaConf.select(cfg, 'curriculum', default=None)
+        self.curriculum_enabled = (
+            _cur_cfg is not None
+            and OmegaConf.select(_cur_cfg, 'enabled', default=False)
+            and OmegaConf.select(cfg, 'mode', default='ppo') == 'ppo'
+        )
+        self.curriculum_manager = None
+        if self.curriculum_enabled:
+            from curriculum_manager import CurriculumManager
+            self.curriculum_manager = CurriculumManager(_cur_cfg)
+            sc = self.curriculum_manager.get_stage_config()
+            self.reward_shaper = RewardShaper(
+                preset=sc["reward_preset"],
+                speed_target=sc["speed_target"],
+                speed_sigma=sc["speed_sigma"],
+            )
+            # Override spawn_mode and spawn_radius from curriculum stage
+            self.spawn_mode = sc["spawn_mode"]
+            self._curriculum_spawn_radius = sc.get("spawn_radius", 3.0)
+            print(f"[Navigation Environment]: Curriculum enabled — Stage {self.curriculum_manager.stage} ({sc['reward_preset']})")
+        else:
+            _speed_target = float(OmegaConf.select(cfg, 'reward.speed_target', default=3.0))
+            _speed_sigma  = float(OmegaConf.select(cfg, 'reward.speed_sigma',  default=1.5))
+            self.reward_shaper = RewardShaper(
+                preset="full_navigation",
+                speed_target=_speed_target,
+                speed_sigma=_speed_sigma,
+            )
+            print(f"[Navigation Environment]: Privilege-free reward — full_navigation "
+                  f"(speed_target={_speed_target}, sigma={_speed_sigma})")
+        # Keep a class reference for fast static-method calls in _compute_state_and_obs.
+        self._RS = RewardShaper
+
 
         # LiDAR Intialization
         ray_caster_cfg = RayCasterCfg(
@@ -124,8 +161,6 @@ class NavigationEnv(IsaacEnv):
             self.target_dir = torch.zeros(self.num_envs, 1, 3)
             self.height_range = torch.zeros(self.num_envs, 1, 2)
             self.prev_drone_vel_w = torch.zeros(self.num_envs, 1 , 3)
-            # progress reward: track previous distance to goal
-            self.prev_target_distance = torch.full((self.num_envs, 1), float('inf'), device=self.device)
             # self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             # self.target_pos[:, 0, 1] = 24.
             # self.target_pos[:, 0, 2] = 2.     
@@ -352,7 +387,7 @@ class NavigationEnv(IsaacEnv):
         num_new_goal = torch.sum(dyn_obs_new_goal_mask)
         sample_x_local = -self.cfg.env_dyn.local_range[0] + 2. * self.cfg.env_dyn.local_range[0] * torch.rand(num_new_goal, 1, dtype=torch.float, device=self.cfg.device)
         sample_y_local = -self.cfg.env_dyn.local_range[1] + 2. * self.cfg.env_dyn.local_range[1] * torch.rand(num_new_goal, 1, dtype=torch.float, device=self.cfg.device)
-        sample_z_local = -self.cfg.env_dyn.local_range[1] + 2. * self.cfg.env_dyn.local_range[2] * torch.rand(num_new_goal, 1, dtype=torch.float, device=self.cfg.device)
+        sample_z_local = -self.cfg.env_dyn.local_range[2] + 2. * self.cfg.env_dyn.local_range[2] * torch.rand(num_new_goal, 1, dtype=torch.float, device=self.cfg.device)
         sample_goal_local = torch.cat([sample_x_local, sample_y_local, sample_z_local], dim=1)
     
         # apply local goal to the global range
@@ -446,8 +481,10 @@ class NavigationEnv(IsaacEnv):
             "truncated": UnboundedContinuousTensorSpec(1),
             "distance_to_goal": UnboundedContinuousTensorSpec(1),
             "speed": UnboundedContinuousTensorSpec(1),
-            "reward_vel": UnboundedContinuousTensorSpec(1),
-            "reward_progress": UnboundedContinuousTensorSpec(1),
+            # Privilege-free reward components (hardware-available signals)
+            "reward_progress": UnboundedContinuousTensorSpec(1),   # vel · dir_hat × 10
+            "reward_heading":  UnboundedContinuousTensorSpec(1),   # cos(vel, dir) × 5
+            "reward_speed":    UnboundedContinuousTensorSpec(1),   # Gaussian speed-band × 3
             "reward_safety_static": UnboundedContinuousTensorSpec(1),
             "reward_safety_dynamic": UnboundedContinuousTensorSpec(1),
             "penalty_smooth": UnboundedContinuousTensorSpec(1),
@@ -467,6 +504,11 @@ class NavigationEnv(IsaacEnv):
     
     def reset_target(self, env_ids: torch.Tensor):
         if (self.training):
+            # ── Curriculum override: stage-aware target placement ──
+            if self.curriculum_enabled and self.curriculum_manager is not None:
+                self._reset_target_curriculum(env_ids)
+                return
+
             # decide which side
             masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]], dtype=torch.float, device=self.device)
             edge_x = self.spawn_target_edge_x
@@ -495,6 +537,59 @@ class NavigationEnv(IsaacEnv):
             self.target_pos[:, 0, 0] = torch.linspace(-0.5, 0.5, self.num_envs) * 32.
             self.target_pos[:, 0, 1] = -self.spawn_target_edge_y
             self.target_pos[:, 0, 2] = 2.            
+
+    def _reset_target_curriculum(self, env_ids: torch.Tensor):
+        """Place targets according to curriculum stage config."""
+        sc = self.curriculum_manager.get_stage_config()
+        B = env_ids.size(0)
+        target_pos = torch.zeros(B, 1, 3, dtype=torch.float, device=self.device)
+        d_min, d_max = sc["target_distance"]
+
+        if sc["target_mode"] == "direction":
+            # Random bearing + distance from (0, 0) — used in Stage 1
+            angles = torch.rand(B, device=self.device) * 2.0 * torch.pi
+            dists = d_min + torch.rand(B, device=self.device) * (d_max - d_min)
+            target_pos[:, 0, 0] = dists * torch.cos(angles)
+            target_pos[:, 0, 1] = dists * torch.sin(angles)
+        else:
+            # "point" mode — targets on map edges (same as original reset_target)
+            edge_x = self.spawn_target_edge_x
+            edge_y = self.spawn_target_edge_y
+            masks = torch.tensor([[1., 0., 1.], [1., 0., 1.], [0., 1., 1.], [0., 1., 1.]],
+                                 dtype=torch.float, device=self.device)
+            shifts = torch.tensor([[0., edge_y, 0.], [0., -edge_y, 0.],
+                                   [edge_x, 0., 0.], [-edge_x, 0., 0.]],
+                                  dtype=torch.float, device=self.device)
+            idx = np.random.randint(0, 4, size=B)
+            target_pos[:, 0, 0] = (2.0 * edge_x) * torch.rand(B, device=self.device) - edge_x
+            target_pos[:, 0, 1] = (2.0 * edge_y) * torch.rand(B, device=self.device) - edge_y
+            target_pos = target_pos * masks[idx].unsqueeze(1) + shifts[idx].unsqueeze(1)
+
+        heights = 0.5 + torch.rand(B, device=self.device) * (2.5 - 0.5)
+        target_pos[:, 0, 2] = heights
+        self.target_pos[env_ids] = target_pos
+
+    def apply_curriculum_stage(self) -> None:
+        """Re-read current curriculum stage config and update env parameters.
+
+        Called by the training loop after ``CurriculumManager.advance()``.
+        """
+        if not self.curriculum_enabled:
+            return
+        sc = self.curriculum_manager.get_stage_config()
+        # Update spawn mode and spawn radius
+        self.spawn_mode = sc.get("spawn_mode", self.spawn_mode)
+        self._curriculum_spawn_radius = float(sc.get("spawn_radius", getattr(self, '_curriculum_spawn_radius', 3.0)))
+        # Update max episode length
+        new_max = sc.get("max_episode_length", None)
+        if new_max is not None:
+            self.max_episode_length = int(new_max)
+        # Update reward shaper preset, speed target & speed sigma from stage config
+        self.reward_shaper.update_config(
+            preset=sc["reward_preset"],
+            speed_target=sc.get("speed_target", self.reward_shaper.speed_target),
+            speed_sigma=sc.get("speed_sigma", self.reward_shaper.speed_sigma),
+        )
 
     def _sample_safe_interior_positions(self, env_ids: torch.Tensor) -> torch.Tensor:
         """Sample interior spawn positions from precomputed valid flat patches.
@@ -541,8 +636,18 @@ class NavigationEnv(IsaacEnv):
             elif self.spawn_mode == "interior_safe":
                 # Sample from obstacle-free interior empty space.
                 pos = self._sample_safe_interior_positions(env_ids)
+            elif self.spawn_mode == "center":
+                # Curriculum Stage 1: spawn near map centre within a small radius.
+                radius = float(getattr(self, '_curriculum_spawn_radius', 3.0))
+                pos = torch.zeros(env_ids.size(0), 1, 3, dtype=torch.float, device=self.device)
+                angles = torch.rand(env_ids.size(0), device=self.device) * 2.0 * torch.pi
+                dists = torch.rand(env_ids.size(0), device=self.device) * radius
+                pos[:, 0, 0] = dists * torch.cos(angles)
+                pos[:, 0, 1] = dists * torch.sin(angles)
+                heights = 0.5 + torch.rand(env_ids.size(0), dtype=torch.float, device=self.device) * (2.5 - 0.5)
+                pos[:, 0, 2] = heights
             else:
-                raise ValueError(f"Unknown env.spawn_mode='{self.spawn_mode}'. Expected 'edge' or 'interior_safe'.")
+                raise ValueError(f"Unknown env.spawn_mode='{self.spawn_mode}'. Expected 'edge', 'interior_safe', or 'center'.")
             
             # pos = torch.zeros(len(env_ids), 1, 3, device=self.device)
             # pos[:, 0, 0] = (env_ids / self.num_envs - 0.5) * 32.
@@ -571,8 +676,6 @@ class NavigationEnv(IsaacEnv):
         self.height_range[env_ids, 0, 1] = torch.max(pos[:, 0, 2], self.target_pos[env_ids, 0, 2])
 
         self.stats[env_ids] = 0.
-        # reset progress distance so the first step doesn't produce a fake progress bonus
-        self.prev_target_distance[env_ids] = float('inf')
         # pit #5: reset hierarchical controller PID state for terminated envs
         if self.use_topo:
             self.hierarchical_controller.reset_partial(env_ids)
@@ -791,51 +894,30 @@ class NavigationEnv(IsaacEnv):
 
 
         # -----------------Reward Calculation-----------------
-        # Design: approaching the goal is the ABSOLUTE core. All terms are scaled to
-        # meaningful magnitudes so each component is clearly felt by the optimizer.
-        #
-        # Expected per-step value ranges (v_max=2 m/s, dt≈0.02 s → max Δd≈0.04 m):
-        #   reward_progress : ±8        BIDIRECTIONAL — penalty when retreating (CORE)
-        #   reward_vel      : ±20       speed projected on goal direction
-        #   approach_bonus  : 1 – 50    dense inverse-distance potential, always pulls toward goal
-        #   reach_goal_bonus: 500       terminal success (fires once, then episode resets)
-        #   collision       : −200      severe episode-ending penalty
-        #   penalty_smooth  : ≈ −2      regularisation against jerky motion
-        #   penalty_height  : large     quadratic OOB penalty ×20
+        # All signals are sourced from hardware-available sensors:
+        #   velocity        → onboard IMU
+        #   direction vec   → GPS position + known target position
+        #   LiDAR scan      → onboard lidar
+        #   height          → barometric altimeter
+        #   collision       → lidar min-clearance
+        # NO privileged simulation state (global distance delta, inverse potential, etc.)
 
-        # a. Safety rewards — kept for logging only, weight = 0 in final sum.
-        #    (Adding safety reward to RL objective causes hovering near obstacles.)
-        reward_safety_static = torch.log((self.lidar_range - self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)).mean(dim=(2, 3))
+        # a. LiDAR safety signals (for stats logging; also consumed by RewardShaper).
+        reward_safety_static = torch.log(
+            (self.lidar_range - self.lidar_scan).clamp(min=1e-6, max=self.lidar_range)
+        ).mean(dim=(2, 3))  # (B, 1)
 
-        if (self.cfg.env_dyn.num_obstacles != 0):
-            reward_safety_dynamic = torch.log((closest_dyn_obs_distance_reward).clamp(min=1e-6, max=self.lidar_range)).mean(dim=-1, keepdim=True)
+        if self.cfg.env_dyn.num_obstacles != 0:
+            reward_safety_dynamic = torch.log(
+                closest_dyn_obs_distance_reward.clamp(min=1e-6, max=self.lidar_range)
+            ).mean(dim=-1, keepdim=True)
         else:
             reward_safety_dynamic = torch.zeros(self.num_envs, 1, device=self.cfg.device)
 
-        # b. CORE — Bidirectional progress: reward approaching, PENALISE retreating.
-        #    delta_d > 0: drone got closer this step → reward
-        #    delta_d < 0: drone moved farther away   → penalty  (critical new signal)
-        #    Guard the first step after reset where prev_target_distance = inf.
-        distance_for_reward = distance.squeeze(1)                                           # (B, 1)
-        valid_progress = (self.prev_target_distance < 1e6)                                  # (B, 1) bool
-        delta_d = (self.prev_target_distance - distance_for_reward) * valid_progress.float()  # (B, 1) meters
-        self.prev_target_distance = distance_for_reward.clone()
-        reward_progress = delta_d * 300.0   # ±8 / step at v_max; negative when retreating
-
-        # c. Velocity projected onto goal direction — continuous directional signal.
-        #    Positive when flying toward goal, negative when flying away.
-        vel_direction = rpos / distance.clamp_min(1e-6)                                    # unit vector (B, 1, 3)
-        reward_vel = (self.drone.vel_w[..., :3] * vel_direction).sum(-1)                   # (B, 1), ∈ [−v_max, +v_max]
-
-        # d. Inverse-distance potential — dense pull at ALL distances.
-        #    F(d) = 50 / (d + 1):  d=0.5m→33,  d=5m→8.3,  d=20m→2.4,  d=48m→1.0
-        #    Works from the very first step (no cold-start dead zone unlike 1/d²).
-        approach_bonus = 50.0 / (distance_for_reward + 1.0)                                # (B, 1)
-
-        # e. Smoothness penalty — jerk regularisation.
+        # b. Smoothness penalty — jerk regularisation (stats + RewardShaper).
         penalty_smooth = (self.drone.vel_w[..., :3] - self.prev_drone_vel_w).norm(dim=-1)  # (B, 1)
 
-        # f. Height penalty — quadratic when outside allowed band.
+        # c. Height penalty — quadratic when outside allowed band (stats + RewardShaper).
         penalty_height = torch.zeros(self.num_envs, 1, device=self.cfg.device)
         penalty_height[self.drone.pos[..., 2] > (self.height_range[..., 1] + 0.2)] = (
             (self.drone.pos[..., 2] - self.height_range[..., 1] - 0.2) ** 2
@@ -844,46 +926,45 @@ class NavigationEnv(IsaacEnv):
             (self.height_range[..., 0] - 0.2 - self.drone.pos[..., 2]) ** 2
         )[self.drone.pos[..., 2] < (self.height_range[..., 0] - 0.2)]
 
-        # g. Collision detection.
+        # d. Collision detection (lidar-based, hardware-available).
         static_collision = einops.reduce(self.lidar_scan, "n 1 w h -> n 1", "max") > (self.lidar_range - 0.3)
         collision = static_collision | dynamic_collision
 
-        # h. Reach-goal terminal bonus — large enough to make success unambiguously worth it.
-        #    Threshold expanded to 1.0 m so the gradient "turns on" slightly earlier.
-        reach_goal = (distance_for_reward < 1.0)         # (B, 1) bool
-        reach_goal_bonus = reach_goal.float() * 500.0    # fires once, episode resets immediately
+        # e. Reach-goal detection (GPS-based distance, available on real robot).
+        distance_for_reward = distance.squeeze(1)          # (B, 1)
+        reach_goal = (distance_for_reward < 1.0)           # (B, 1) bool
 
-        # i. Horizontal out-of-bounds — must be computed before reward sum below.
+        # f. Horizontal out-of-bounds.
         out_of_bounds_xy = (
             (self.drone.pos[..., 0].abs() > self.terrain_half_extent_x)
             | (self.drone.pos[..., 1].abs() > self.terrain_half_extent_y)
         )  # (B, 1) bool
 
-        # ==== Final reward ====
-        # reward_progress   CORE bidirectional: ±200 × Δd ≈ ±8 / step
-        # reward_vel ×10    velocity toward goal: ±20
-        # approach_bonus    50/(d+1): dense potential, 1–50
-        # reach_goal_bonus  500 terminal success (one-time)
-        # collision  ×−200  severe penalty (episode-ending)
-        # out_of_bounds_xy  −200 horizontal map-exit penalty (episode-ending)
-        # penalty_smooth ×−2  jerk regularisation
-        # penalty_height ×−20 quadratic OOB
-        self.reward = (
-              reward_progress                   # CORE: bidirectional, ±8 / step
-            + reward_vel * 10.0                 # velocity direction guide: ±20
-            + approach_bonus                    # dense distance shaping: 1–50
-            + reach_goal_bonus                  # terminal success: 500
-            - collision.float() * 200.0         # collision: −200
-            - out_of_bounds_xy.float() * 200.0  # horizontal boundary exit: −200
-            - penalty_smooth * 2.0              # jerk regularisation
-            - penalty_height * 20.0             # height OOB constraint
-        )
+        # ==== Unified privilege-free reward (all modes: ppo, graph_ppo, curriculum) ====
+        _ctx = {
+            "vel_w":            self.drone.vel_w,
+            "prev_vel_w":       self.prev_drone_vel_w,
+            "target_dir_2d":    target_dir_2d,
+            "lidar_scan":       self.lidar_scan,
+            "lidar_range":      self.lidar_range,
+            "drone_pos":        self.drone.pos,
+            "height_range":     self.height_range,
+            "collision":        collision,
+            "reach_goal":       reach_goal,
+            "out_of_bounds_xy": out_of_bounds_xy,
+            "distance":         distance,
+        }
+        if self.cfg.env_dyn.num_obstacles != 0:
+            _ctx["closest_dyn_obs_distance_reward"] = closest_dyn_obs_distance_reward
+        self.reward = self.reward_shaper.compute(_ctx)
 
-        # Graph-PPO: QP intervention penalty + tracking error penalty.
+        # Graph-PPO: QP intervention penalty + tracking error penalty (additive on top).
         # Scale lifted to match new reward magnitudes.
         if self.use_topo and hasattr(self, '_last_intervention') and self._last_intervention is not None:
             I_t     = self._last_intervention                                      # (B,)
-            r_intv  = 2.0 * (torch.exp(-I_t ** 2 / (2 * 0.25)) - 1.0)            # ∈ [−2, 0]
+            # Smooth penalty: exp-Gaussian maps intervention magnitude to [−1, 0] per unit weight
+            intv_w  = float(self.cfg.topo.reward_intervention_weight)               # config: -0.5
+            r_intv  = intv_w * (1.0 - torch.exp(-I_t ** 2 / (2 * 0.25)))          # ∈ [intv_w, 0]
             track_w = float(self.cfg.topo.reward_tracking_weight)
             self.reward = self.reward \
                 + r_intv.unsqueeze(-1) \
@@ -899,9 +980,8 @@ class NavigationEnv(IsaacEnv):
         # progress_buf is incremented by isaac_env._step() BEFORE _compute_reward_and_done() is
         # called, so at step N the counter already reads N.  The condition >= max_episode_length
         # correctly fires on the last step (step 1000 when max_episode_length=1000).
-        # truncated will appear as 0 when every episode ends via terminated (collision / goal)
-        # before reaching the time limit — that is expected and correct behaviour.
-        self.truncated = self.terminated
+        # truncated = time-limit only (not collision/goal); terminated = natural end-of-episode.
+        self.truncated = (self.progress_buf >= self.max_episode_length).unsqueeze(1) & ~self.terminated
 
         # update previous velocity for smoothness calculation in the next ieteration
         self.prev_drone_vel_w = self.drone.vel_w[..., :3].clone()
@@ -912,11 +992,18 @@ class NavigationEnv(IsaacEnv):
         self.stats["reach_goal"] = reach_goal.float()
         self.stats["collision"] = collision.float()
         self.stats["truncated"] = self.truncated.float()
-        self.stats["distance_to_goal"] = distance.squeeze(1)
+        self.stats["distance_to_goal"] = distance_for_reward
         self.stats["speed"] = self.drone.vel_w[..., :3].norm(dim=-1, keepdim=True)
-        self.stats["reward_vel"] = reward_vel
-        self.stats["reward_progress"] = reward_progress
-        self.stats["reward_safety_static"] = reward_safety_static
+        # Privilege-free reward component stats (static methods, no extra alloc overhead)
+        self.stats["reward_progress"] = self._RS._progress_local(
+            self.drone.vel_w, target_dir_2d) * 10.0          # vel · dir_hat × 10
+        self.stats["reward_heading"]  = self._RS._heading_reward(
+            self.drone.vel_w, target_dir_2d) * 5.0           # cos(vel, dir) × 5
+        self.stats["reward_speed"]    = self._RS._speed_band(
+            self.drone.vel_w,
+            self.reward_shaper.speed_target,
+            self.reward_shaper.speed_sigma) * 3.0            # speed-band Gaussian × 3
+        self.stats["reward_safety_static"]  = reward_safety_static
         self.stats["reward_safety_dynamic"] = reward_safety_dynamic
         self.stats["penalty_smooth"] = penalty_smooth
         self.stats["penalty_height"] = penalty_height

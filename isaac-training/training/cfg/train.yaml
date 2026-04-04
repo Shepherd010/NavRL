@@ -4,6 +4,7 @@ defaults:
   - ppo
   - sim
   - topo
+  - curriculum
 
 headless: True
 mode: graph_ppo  # ppo | graph_ppo
@@ -47,6 +48,12 @@ wandb:
   name: navigation_training
   entity: shepherd010
   mode: online # offline
+
+# Privilege-free reward parameters (used when curriculum.enabled=false)
+# Override with: reward.speed_target=3.5 reward.speed_sigma=1.2 etc.
+reward:
+  speed_target: 3.0   # centre of Gaussian speed-band reward (m/s)
+  speed_sigma: 1.5    # width of speed-band Gaussian
   run_id: #kw9xf9k9
 
 # Visualization (V1 topo graph, V2 attention heatmaps, V3 reward bars)

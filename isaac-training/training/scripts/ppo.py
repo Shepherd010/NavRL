@@ -176,12 +176,21 @@ class PPO(TensorDictModuleBase):
 
     def enable_teacher_distill(self, teacher_policy, distill_cfg):
         """Attach a frozen CNN-PPO teacher for graph_ppo velocity distillation."""
+        from omegaconf import OmegaConf, DictConfig
         self.teacher_policy = teacher_policy
         self.teacher_distill_enabled = True
-        self.teacher_distill_weight = float(getattr(distill_cfg, 'weight', 1.0))
-        self.teacher_distill_min_weight = float(getattr(distill_cfg, 'min_weight', 0.0))
-        self.teacher_distill_warmup_steps = int(getattr(distill_cfg, 'warmup_steps', 0))
-        self.teacher_distill_decay_steps = int(getattr(distill_cfg, 'decay_steps', 0))
+        # Use OmegaConf.select for DictConfig (getattr raises ConfigAttributeError on missing keys)
+        _get = (lambda c, k, d: OmegaConf.select(c, k, default=d)) if isinstance(distill_cfg, DictConfig) \
+               else (lambda c, k, d: getattr(c, k, d))
+        self.teacher_distill_weight = float(_get(distill_cfg, 'weight', 1.0))
+        self.teacher_distill_min_weight = float(_get(distill_cfg, 'min_weight', 0.0))
+        self.teacher_distill_warmup_steps = int(_get(distill_cfg, 'warmup_steps', 0))
+        self.teacher_distill_decay_steps = int(_get(distill_cfg, 'decay_steps', 0))
+
+    def disable_teacher_distill(self):
+        """Detach teacher distillation (curriculum stage switch)."""
+        self.teacher_distill_enabled = False
+        self.teacher_policy = None
 
     def _teacher_distill_weight_now(self):
         if not self.teacher_distill_enabled:
@@ -203,32 +212,58 @@ class PPO(TensorDictModuleBase):
 
     @torch.no_grad()
     def _teacher_velocity_from_obs(self, tensordict):
-        """Run frozen CNN teacher on current obs and return world-frame velocity (B, 3)."""
+        """Run frozen CNN teacher on current obs and return world-frame velocity (B, 3).
+
+        Uses the deterministic Beta-distribution mean as action (alpha/(alpha+beta)),
+        which is identical to the _forward_ppo path minus the stochastic sample.
+        Keeps shapes consistent with how _forward_ppo maps action_normalized → world vel.
+        """
         if self.teacher_policy is None:
             raise RuntimeError("Teacher distillation is enabled but teacher_policy is None")
 
+        # Build a minimal tensordict with only the CNN-PPO obs keys.
+        # batch_size must match the minibatch (first dim of tensordict).
+        B = tensordict.batch_size[0]
         td_teacher = TensorDict({
             "agents": TensorDict({
                 "observation": TensorDict({
-                    "lidar": tensordict["agents", "observation", "lidar"],
+                    "lidar":            tensordict["agents", "observation", "lidar"],
                     "dynamic_obstacle": tensordict["agents", "observation", "dynamic_obstacle"],
-                    "state": tensordict["agents", "observation", "state"],
-                    "direction": tensordict["agents", "observation", "direction"],
-                }, batch_size=tensordict.batch_size),
-            }, batch_size=tensordict.batch_size),
-        }, batch_size=tensordict.batch_size, device=self.device)
+                    "state":            tensordict["agents", "observation", "state"],
+                    "direction":        tensordict["agents", "observation", "direction"],
+                }, batch_size=[B]),
+            }, batch_size=[B]),
+        }, batch_size=[B], device=self.device)
 
+        # Run feature extractor (writes "_feature" into td_teacher).
         self.teacher_policy.feature_extractor(td_teacher)
-        self.teacher_policy.actor.module(td_teacher)
-        alpha = td_teacher["alpha"]
-        beta = td_teacher["beta"]
-        action_norm = alpha / (alpha + beta).clamp_min(1e-6)
-        action_local = (2 * action_norm * self.teacher_policy.cfg.actor.action_limit) - self.teacher_policy.cfg.actor.action_limit
-        action_world = vec_to_world(action_local, td_teacher["agents", "observation", "direction"])
 
-        # Keep shape (B, 3) for distillation target.
+        # Run the BetaActor head directly to get alpha/beta without TorchRL sampling.
+        # teacher.actor is a ProbabilisticActor wrapping TensorDictModule(BetaActor).
+        # Calling it directly would sample from Beta; we want the mean instead.
+        # Access the inner TensorDictModule (first element in the sequential) and call it.
+        # actor.module is nn.ModuleList([TensorDictModule(BetaActor), ...]).
+        # Index [0] is the TensorDictModule that reads "_feature" and writes alpha/beta.
+        self.teacher_policy.actor.module[0](td_teacher)     # writes alpha, beta → td_teacher
+
+        alpha = td_teacher["alpha"]   # (B, action_dim) or (B, 1, action_dim)
+        beta  = td_teacher["beta"]
+
+        # Deterministic mean of Beta distribution: μ = alpha / (alpha + beta)
+        # Parentheses are critical: must divide alpha by (alpha+beta), not (alpha+beta-clamp).
+        action_norm = alpha / (alpha + beta + 1e-6)          # (B, action_dim) or (B, 1, action_dim)
+
+        # Map [0,1] → [-limit, +limit], same formula as _forward_ppo.
+        limit = self.teacher_policy.cfg.actor.action_limit
+        action_local = (2.0 * action_norm * limit) - limit   # (B, ..., 3)
+
+        # vec_to_world expects (B, 3) or (B, 1, 3); direction is (B, 1, 3).
+        direction = td_teacher["agents", "observation", "direction"]
+        action_world = vec_to_world(action_local, direction)  # (B, 1, 3) or (B, 3)
+
+        # Normalise to (B, 3) so distillation MSE is straightforward.
         if action_world.dim() == 3:
-            action_world = action_world.squeeze(1)
+            action_world = action_world.squeeze(1)            # (B, 3)
         return action_world
 
     # ------------------------------------------------------------------
@@ -290,7 +325,7 @@ class PPO(TensorDictModuleBase):
         ego_pos   = node_positions[:, 0, :]                      # (B, 3)
         dir_vec   = cand_pos - ego_pos                           # (B, 3)
         # doc/06 §4.2.2: speed = min(v_target, dist/dt_low) so drone decelerates near node
-        _dt_low   = 1.0 / 10.0                                   # high-level period = 0.1 s
+        _dt_low   = 1.0 / float(getattr(self.topo_cfg, 'low_freq', 10.0))  # high-level period
         _dist     = dir_vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (B, 1)
         _speed    = torch.minimum(
             torch.full_like(_dist, self.v_target),
@@ -476,13 +511,13 @@ class PPO(TensorDictModuleBase):
             ego_pos = node_positions[:, :1, :]               # (B, 1, 3)
             cand_pos = node_positions[:, 1:, :]              # (B, N, 3)
             dir_vec = cand_pos - ego_pos                     # (B, N, 3)
-            dist = dir_vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-            dt_low = 1.0 / 10.0
+            _node_dist = dir_vec.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            dt_low = 1.0 / float(getattr(self.topo_cfg, 'low_freq', 10.0))
             speed = torch.minimum(
-                torch.full_like(dist, self.v_target),
-                dist / dt_low,
+                torch.full_like(_node_dist, self.v_target),
+                _node_dist / dt_low,
             )
-            cand_vel = (dir_vec / dist) * speed              # (B, N, 3)
+            cand_vel = (dir_vec / _node_dist) * speed        # (B, N, 3)
             cand_vel = cand_vel.clone()
             cand_vel[..., 2] = 0.0
             v_student = (probs.unsqueeze(-1) * cand_vel).sum(dim=1)  # (B, 3)

@@ -1,0 +1,79 @@
+# Curriculum Learning Configuration
+# Plugin-style: set curriculum.enabled=false for zero impact on existing training paths.
+# Used ONLY in mode=ppo; graph_ppo ignores this entirely.
+
+curriculum:
+  enabled: false              # master switch — false = original training, no side effects
+  stage: 1                    # 1=stable-flight | 2=goal-directed | 3=full-navigation
+  auto_advance: true          # auto-promote stage based on metrics
+
+  # ── Stage 1: Stable Flight ─────────────────────────────────────────
+  # Goal: learn to fly forward at 2-5 m/s without crashing.
+  # No obstacles.  Short episodes.  Spawn near map centre.
+  stage1:
+    max_frames: 5e6
+    num_obstacles: 0          # static obstacles (overrides env.num_obstacles)
+    dyn_obstacles: 0          # dynamic obstacles (overrides env_dyn.num_obstacles)
+    spawn_mode: center        # spawn near map centre
+    spawn_radius: 3.0         # metres around (0,0)
+    target_mode: direction    # place target at random bearing + distance
+    target_distance: [5, 10]  # [min, max] metres
+    max_episode_length: 300
+    speed_target: 2.5         # centre of desired speed band (m/s)
+    speed_sigma: 1.0          # width of Gaussian speed reward
+    reward_preset: stable_flight
+
+  # ── Stage 2: Goal-Directed Navigation (no obstacles) ───────────────
+  # Goal: reach a distant target point using only direction observation.
+  stage2:
+    max_frames: 20e6
+    num_obstacles: 0
+    dyn_obstacles: 0
+    spawn_mode: edge
+    target_mode: point
+    target_distance: [10, 30]
+    max_episode_length: 600
+    speed_target: 3.0
+    speed_sigma: 1.5
+    reward_preset: goal_navigation
+
+  # ── Stage 3: Full Navigation (with obstacles) ─────────────────────
+  # Goal: navigate cluttered environment with static + dynamic obstacles.
+  stage3:
+    max_frames: 50e6
+    num_obstacles: 350
+    dyn_obstacles: 80
+    spawn_mode: interior_safe
+    target_mode: point
+    target_distance: [20, 48]
+    max_episode_length: 1000
+    speed_target: 3.0
+    speed_sigma: 1.5
+    reward_preset: full_navigation
+
+  # ── Auto-advance thresholds ────────────────────────────────────────
+  advance:
+    stage1_to_2:
+      min_episode_len: 200    # mean episode length threshold (not crashing early)
+      avg_speed: 1.5          # mean speed (m/s) >= this
+      heading_accuracy: 0.6   # mean cos(heading_error) >= this
+      window: 50              # number of finished episodes to average over
+    stage2_to_3:
+      reach_goal_rate: 0.3    # fraction of episodes that reach goal
+      avg_speed: 2.0
+      window: 100
+
+  # ── Teacher distillation (per-stage control) ───────────────────────
+  teacher:
+    enabled: true
+    checkpoint: "/home/worku22/code/NavRL/ros1/navigation_runner/scripts/ckpts/navrl_checkpoint.pt"
+    weight: 1.0
+    min_weight: 0.05
+    warmup_steps: 5000
+    decay_steps: 100000
+    stages: [2, 3]            # enable distillation only in these stages
+
+  # ── DAgger-style action mixing (Stage 1 only) ─────────────────────
+  dagger:
+    enabled: false            # optional: mix policy with PID reference in stage 1
+    mix_frames: 1e6           # linearly anneal α from 0→1 over this many frames

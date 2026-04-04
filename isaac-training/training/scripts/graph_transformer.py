@@ -394,5 +394,6 @@ class GraphTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     def need_spd_matrix(self) -> bool:
-        # SPD is only required when SPD bias is enabled.
-        return bool(self.use_spd_bias)
+        # SPD is only used when BOTH topo_bias and spd_bias are enabled.
+        # With use_topo_bias=false, the SPD MLP doesn't exist — skip Floyd-Warshall.
+        return bool(self.use_spd_bias and self.use_topo_bias)
