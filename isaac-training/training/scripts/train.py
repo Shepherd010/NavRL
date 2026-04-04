@@ -41,7 +41,30 @@ def _load_policy_state(policy: PPO, ckpt_path: str, device: str, strict: bool = 
     state = torch.load(ckpt_path, map_location=device)
     if isinstance(state, dict) and "policy" in state:
         state = state["policy"]
+    # Drop runtime-only frozen helper modules saved from previous runs.
+    runtime_only_prefixes = (
+        "teacher_policy.",
+        "ppo_prior_policy.",
+    )
+    if isinstance(state, dict):
+        state = {
+            key: value for key, value in state.items()
+            if not key.startswith(runtime_only_prefixes)
+        }
     policy.load_state_dict(state, strict=strict)
+
+
+def _policy_state_for_save(policy: PPO) -> dict:
+    """Return a clean state_dict excluding runtime-only helper submodules."""
+    runtime_only_prefixes = (
+        "teacher_policy.",
+        "ppo_prior_policy.",
+    )
+    state = policy.state_dict()
+    return {
+        key: value for key, value in state.items()
+        if not key.startswith(runtime_only_prefixes)
+    }
 
 
 
@@ -407,14 +430,14 @@ def main(cfg):
         # Save Model
         if i % cfg.save_interval == 0:
             ckpt_path = os.path.join(run.dir, f"checkpoint_{i}.pt")
-            save_dict = policy.state_dict()
+            save_dict = _policy_state_for_save(policy)
             if curriculum_mgr is not None:
                 save_dict = {"policy": save_dict, "curriculum": curriculum_mgr.state_dict()}
             torch.save(save_dict, ckpt_path)
             print("[NavRL]: model saved at training step: ", i)
 
     ckpt_path = os.path.join(run.dir, "checkpoint_final.pt")
-    save_dict = policy.state_dict()
+    save_dict = _policy_state_for_save(policy)
     if curriculum_mgr is not None:
         save_dict = {"policy": save_dict, "curriculum": curriculum_mgr.state_dict()}
     torch.save(save_dict, ckpt_path)
