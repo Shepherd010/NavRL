@@ -225,53 +225,87 @@ class NavigationEnv(IsaacEnv):
         # Stage 3 switches spawn_mode to "interior_safe" at runtime; if flat patches were
         # not baked at startup the terrain importer has no valid patch bank and
         # _sample_safe_interior_positions() raises RuntimeError.
-        if self.spawn_mode == "interior_safe" or self.curriculum_enabled:
-            obstacle_cfg_kwargs["flat_patch_sampling"] = {
-                "init_pos": FlatPatchSamplingCfg(
-                    num_patches=self.interior_spawn_num_patches,
-                    patch_radius=self.interior_spawn_patch_radius,
-                    x_range=(-self.map_range[0] + 1.0, self.map_range[0] - 1.0),
-                    y_range=(-self.map_range[1] + 1.0, self.map_range[1] - 1.0),
-                    z_range=(-0.05, 0.15),
-                    max_height_diff=self.interior_spawn_max_height_diff,
-                ),
-            }
+        need_flat_patches = (self.spawn_mode == "interior_safe") or self.curriculum_enabled
+        patch_num = int(self.interior_spawn_num_patches)
+        patch_radius = float(self.interior_spawn_patch_radius)
+        patch_max_hdiff = float(self.interior_spawn_max_height_diff)
 
-        terrain_cfg = TerrainImporterCfg(
-            num_envs=self.num_envs,
-            env_spacing=0.0,
-            prim_path="/World/ground",
-            terrain_type="generator",
-            terrain_generator=TerrainGeneratorCfg(
-                seed=0,
-                size=(self.map_range[0]*2, self.map_range[1]*2), 
-                border_width=self.terrain_border_width,
-                num_rows=1, 
-                num_cols=1, 
-                horizontal_scale=0.1,
-                vertical_scale=0.1,
-                slope_threshold=0.75,
-                use_cache=False,
-                color_scheme="height",
-                sub_terrains={
-                    "obstacles": HfDiscreteObstaclesTerrainCfg(**obstacle_cfg_kwargs),
-                },
-            ),
-            visual_material = None,
-            max_init_terrain_level=None,
-            collision_group=-1,
-            debug_vis=True,
-        )
-        try:
-            self.terrain_importer = TerrainImporter(terrain_cfg)
-        except RuntimeError as exc:
-            if self.spawn_mode == "interior_safe" and "Failed to find valid patches" in str(exc):
-                raise RuntimeError(
-                    "interior_safe 出生模式初始化失败：当前地形中过少可用空地，无法采样足够的 flat patches。\n"
-                    "可尝试减小 env.interior_spawn_num_patches、减小 env.interior_spawn_patch_radius，"
-                    "或增大 env.interior_spawn_max_height_diff。"
-                ) from exc
-            raise
+        # Dense-obstacle maps can fail strict flat patch sampling at startup.
+        # Retry with progressively easier sampling constraints instead of crashing.
+        max_patch_attempts = 4
+        for attempt in range(1, max_patch_attempts + 1):
+            obstacle_cfg_try = dict(obstacle_cfg_kwargs)
+            if need_flat_patches:
+                obstacle_cfg_try["flat_patch_sampling"] = {
+                    "init_pos": FlatPatchSamplingCfg(
+                        num_patches=patch_num,
+                        patch_radius=patch_radius,
+                        x_range=(-self.map_range[0] + 1.0, self.map_range[0] - 1.0),
+                        y_range=(-self.map_range[1] + 1.0, self.map_range[1] - 1.0),
+                        z_range=(-0.05, 0.15),
+                        max_height_diff=patch_max_hdiff,
+                    ),
+                }
+
+            terrain_cfg = TerrainImporterCfg(
+                num_envs=self.num_envs,
+                env_spacing=0.0,
+                prim_path="/World/ground",
+                terrain_type="generator",
+                terrain_generator=TerrainGeneratorCfg(
+                    seed=0,
+                    size=(self.map_range[0] * 2, self.map_range[1] * 2),
+                    border_width=self.terrain_border_width,
+                    num_rows=1,
+                    num_cols=1,
+                    horizontal_scale=0.1,
+                    vertical_scale=0.1,
+                    slope_threshold=0.75,
+                    use_cache=False,
+                    color_scheme="height",
+                    sub_terrains={
+                        "obstacles": HfDiscreteObstaclesTerrainCfg(**obstacle_cfg_try),
+                    },
+                ),
+                visual_material=None,
+                max_init_terrain_level=None,
+                collision_group=-1,
+                debug_vis=True,
+            )
+
+            try:
+                self.terrain_importer = TerrainImporter(terrain_cfg)
+                if need_flat_patches and attempt > 1:
+                    print(
+                        "[Navigation Environment]: flat patch sampling recovered "
+                        f"on attempt {attempt} with num_patches={patch_num}, "
+                        f"patch_radius={patch_radius:.3f}, max_height_diff={patch_max_hdiff:.3f}"
+                    )
+                self.interior_spawn_num_patches = patch_num
+                self.interior_spawn_patch_radius = patch_radius
+                self.interior_spawn_max_height_diff = patch_max_hdiff
+                break
+            except RuntimeError as exc:
+                msg = str(exc)
+                if not need_flat_patches or "Failed to find valid patches" not in msg:
+                    raise
+                if attempt >= max_patch_attempts:
+                    raise RuntimeError(
+                        "interior_safe 出生模式初始化失败：当前地形中可用空地不足，"
+                        "且自适应放宽 flat patch 参数后仍无法采样。\n"
+                        f"最后一次尝试参数: num_patches={patch_num}, "
+                        f"patch_radius={patch_radius:.3f}, max_height_diff={patch_max_hdiff:.3f}.\n"
+                        "可进一步减小 env.interior_spawn_num_patches、减小 env.interior_spawn_patch_radius，"
+                        "或增大 env.interior_spawn_max_height_diff。"
+                    ) from exc
+                patch_num = max(64, patch_num // 2)
+                patch_radius = max(0.15, patch_radius * 0.8)
+                patch_max_hdiff = min(0.50, patch_max_hdiff + 0.05)
+                print(
+                    "[Navigation Environment]: flat patch sampling failed, retry with relaxed params: "
+                    f"attempt={attempt + 1}/{max_patch_attempts}, num_patches={patch_num}, "
+                    f"patch_radius={patch_radius:.3f}, max_height_diff={patch_max_hdiff:.3f}"
+                )
 
         if (self.cfg.env_dyn.num_obstacles == 0):
             return
